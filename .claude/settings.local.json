@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(asusctl --version)",
+      "Bash(asusctl profile:*)",
+      "Read(//sys/class/power_supply/**)",
+      "Read(//sys/class/power_supply/BAT0/**)",
+      "Bash(asusctl:*)",
+      "Read(//sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0C0A:00/power_supply/BAT1/**)",
+      "Bash(xrandr:*)",
+      "Bash(python3 -c \"import subprocess; r = subprocess.run\\([''''asusctl'''', ''''profile'''', ''''get''''], capture_output=True, text=True\\); print\\(repr\\(r.stdout\\)\\)\")",
+      "Bash(gsettings list-schemas:*)",
+      "Read(//home/atm/.local/share/applications/**)",
+      "Read(//usr/share/pixmaps/**)",
+      "Bash(python3 -c \"from PyQt6.QtWidgets import QApplication; print\\(''''ok''''\\)\")",
+      "Bash(python3 -m pip show PyQt6)",
+      "Bash(python3:*)",
+      "Bash(gnome-extensions list:*)",
+      "Bash(gnome-extensions info:*)",
+      "Bash(dnf list:*)",
+      "Bash(chmod:*)",
+      "Bash(pkill:*)",
+      "Read(//sys/class/drm/**)",
+      "Read(//sys/bus/platform/drivers/asus-nb-wmi/**)",
+      "Bash(kill:*)"
+    ]
+  }
+}
