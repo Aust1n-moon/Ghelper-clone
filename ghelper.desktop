@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=G-Helper
 Comment=ASUS ROG G14 control panel
-Exec=python3 __SCRIPT_DIR__/ghelper.py
+Exec=python3 "__SCRIPT_DIR__/ghelper.py"
 Icon=__SCRIPT_DIR__/ghelper-icon.svg
 Terminal=false
 Type=Application

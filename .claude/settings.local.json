@@ -25,7 +25,8 @@
       "Bash(kill:*)",
       "Bash(which gnome-session-quit:*)",
       "Bash(echo:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(update-desktop-database:*)"
     ]
   }
 }

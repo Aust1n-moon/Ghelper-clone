@@ -635,6 +635,8 @@ class MainWindow(QWidget):
 
     def _do_profile(self, profile):
         ok, msg = Backend.set_profile(profile)
+        if ok:
+            _save_setting("profile", profile)
         self._set_status(f"Profile → {profile}" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
 
@@ -748,6 +750,12 @@ class MainWindow(QWidget):
 
     def _restore_settings(self):
         s = _load_settings()
+
+        profile = s.get("profile")
+        if profile and profile in self._profile.buttons:
+            self._profile.set_active(profile)
+            import threading
+            threading.Thread(target=Backend.set_profile, args=(profile,), daemon=True).start()
 
         fan = s.get("fan_preset")
         if fan and fan in self._fan.buttons:
@@ -895,7 +903,7 @@ class GHelperApp:
         menu.addSeparator()
         for p in ("LowPower", "Balanced", "Performance"):
             a = QAction(f"Profile: {p}", self.app)
-            a.triggered.connect(lambda _, pr=p: Backend.set_profile(pr))
+            a.triggered.connect(lambda _, pr=p: self.win._do_profile(pr))
             menu.addAction(a)
 
         menu.addSeparator()
