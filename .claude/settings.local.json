@@ -22,7 +22,9 @@
       "Bash(pkill:*)",
       "Read(//sys/class/drm/**)",
       "Read(//sys/bus/platform/drivers/asus-nb-wmi/**)",
-      "Bash(kill:*)"
+      "Bash(kill:*)",
+      "Bash(which gnome-session-quit:*)",
+      "Bash(echo:*)"
     ]
   }
 }
