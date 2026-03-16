@@ -8,6 +8,9 @@ import json
 import subprocess
 import glob as _glob
 import collections
+import socket
+import os
+import tempfile
 from pathlib import Path
 try:
     import dbus as _dbus
@@ -912,5 +915,56 @@ class GHelperApp:
         return self.app.exec()
 
 
+_SOCKET_PATH = os.path.join(tempfile.gettempdir(), f"ghelper-{os.getenv('USER', 'user')}.sock")
+
+
+def _try_show_existing() -> bool:
+    """Return True if another instance is running (and was told to show)."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(_SOCKET_PATH)
+        s.sendall(b"show")
+        s.close()
+        return True
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        return False
+
+
 if __name__ == "__main__":
-    sys.exit(GHelperApp().run())
+    if _try_show_existing():
+        sys.exit(0)
+
+    app_obj = GHelperApp()
+
+    # Listen for "show" commands from future instances
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        os.unlink(_SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    srv.bind(_SOCKET_PATH)
+    srv.listen(5)
+    srv.setblocking(False)
+
+    def _check_ipc():
+        try:
+            conn, _ = srv.accept()
+            conn.recv(16)
+            conn.close()
+            app_obj.win.show()
+            app_obj.win.raise_()
+            app_obj.win.activateWindow()
+        except BlockingIOError:
+            pass
+
+    ipc_timer = QTimer()
+    ipc_timer.timeout.connect(_check_ipc)
+    ipc_timer.start(500)
+
+    ret = app_obj.run()
+    srv.close()
+    try:
+        os.unlink(_SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    sys.exit(ret)
