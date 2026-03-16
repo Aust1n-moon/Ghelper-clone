@@ -4,11 +4,12 @@ G-Helper Clone — ASUS ROG Zephyrus G14 2024 (GA403) control panel for Fedora L
 """
 
 import sys
+import os
 import subprocess
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QButtonGroup, QGroupBox, QSystemTrayIcon,
-    QMenu, QFrame, QProgressBar,
+    QMenu, QFrame, QProgressBar, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
@@ -18,9 +19,9 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
 # Backend: thin wrappers around asusctl / sysfs
 # ---------------------------------------------------------------------------
 
-def _run(cmd):
+def _run(cmd, timeout=8):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=8)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip(), r.stderr.strip(), r.returncode
     except Exception as e:
         return "", str(e), -1
@@ -122,7 +123,7 @@ class Backend:
 
     @staticmethod
     def set_gpu_mode(mode):
-        out, err, rc = _run(f"supergfxctl -m {mode}")
+        out, err, rc = _run(f"supergfxctl -m {mode}", timeout=60)
         return rc == 0, err or out
 
 
@@ -140,6 +141,18 @@ class StatusWorker(QThread):
             "battery": Backend.get_battery(),
             "gpu":     Backend.get_gpu_mode(),
         })
+
+
+class GpuSwitchWorker(QThread):
+    done = pyqtSignal(bool, str, str)  # ok, msg, mode
+
+    def __init__(self, mode):
+        super().__init__()
+        self._mode = mode
+
+    def run(self):
+        ok, msg = Backend.set_gpu_mode(self._mode)
+        self.done.emit(ok, msg, self._mode)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +283,8 @@ class MainWindow(QWidget):
         self._build_ui()
         self._connect()
         self._worker = None
+        self._gpu_worker = None
+        self._gpu_pending = None
         self._schedule_refresh()
 
     # ------------------------------------------------------------------ UI build
@@ -302,6 +317,16 @@ class MainWindow(QWidget):
         gl.addWidget(self._profile)
         root.addWidget(g)
 
+        # GPU Mode
+        g = QGroupBox("GPU Mode")
+        gl = QVBoxLayout(g)
+        self._gpu = _ButtonRow(["Integrated", "Hybrid", "Dedicated"])
+        gl.addWidget(self._gpu)
+        self._gpu_auto_restart = QCheckBox("Auto restart session after switch")
+        self._gpu_auto_restart.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        gl.addWidget(self._gpu_auto_restart)
+        root.addWidget(g)
+
         # Keyboard
         g = QGroupBox("Keyboard Backlight")
         gl = QVBoxLayout(g)
@@ -322,16 +347,6 @@ class MainWindow(QWidget):
         gl.addWidget(self._slash_on_btn)
         gl.addWidget(self._slash_off_btn)
         gl.addStretch()
-        root.addWidget(g)
-
-        # GPU Mode
-        g = QGroupBox("GPU Mode")
-        gl = QHBoxLayout(g)
-        self._gpu = _ButtonRow(["Integrated", "Hybrid", "Dedicated"])
-        self._gpu_note = QLabel("(logout required)")
-        self._gpu_note.setStyleSheet("color: #475569; font-size: 10px;")
-        gl.addWidget(self._gpu)
-        gl.addWidget(self._gpu_note)
         root.addWidget(g)
 
         # Battery
@@ -404,9 +419,32 @@ class MainWindow(QWidget):
                          "#0ea5e9" if ok else "#ef4444")
 
     def _do_gpu(self, mode):
-        ok, msg = Backend.set_gpu_mode(mode)
-        self._set_status(f"GPU → {mode} (logout to apply)" if ok else f"Error: {msg[:70]}",
-                         "#0ea5e9" if ok else "#ef4444")
+        if self._gpu_worker and self._gpu_worker.isRunning():
+            self._set_status("GPU switch already in progress…", "#f59e0b")
+            return
+        self._set_status(f"Switching GPU to {mode}…", "#f59e0b")
+        self._gpu.setEnabled(False)
+        self._gpu_worker = GpuSwitchWorker(mode)
+        self._gpu_worker.done.connect(self._on_gpu_done)
+        self._gpu_worker.start()
+
+    def _on_gpu_done(self, ok, msg, mode):
+        self._gpu.setEnabled(True)
+        if not ok:
+            self._set_status(f"Error: {msg[:70]}", "#ef4444")
+            return
+        self._gpu_pending = mode
+        if self._gpu_auto_restart.isChecked():
+            self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
+            QTimer.singleShot(1500, lambda: _run(
+                "dbus-send --session --type=method_call "
+                "--dest=org.gnome.SessionManager "
+                "/org/gnome/SessionManager "
+                "org.gnome.SessionManager.Logout uint32:1",
+                timeout=10
+            ))
+        else:
+            self._set_status(f"GPU → {mode} (logout to apply)", "#0ea5e9")
 
     def _do_limit(self, limit):
         ok, msg = Backend.set_charge_limit(limit)
@@ -435,7 +473,7 @@ class MainWindow(QWidget):
 
         self._profile.set_active(profile)
         self._kbd.set_active(kbd)
-        self._gpu.set_active(s.get("gpu", "Unknown"))
+        self._gpu.set_active(self._gpu_pending or s.get("gpu", "Unknown"))
 
         cap = bat.get("capacity", 0)
         self._bat_bar.setValue(cap)
