@@ -111,6 +111,20 @@ class Backend:
         out, err, rc = _run(f"asusctl battery limit {limit}")
         return rc == 0, err or out
 
+    @staticmethod
+    def get_gpu_mode():
+        out, _, rc = _run("supergfxctl -g")
+        if rc == 0:
+            for m in ("Integrated", "Hybrid", "Dedicated", "Vfio"):
+                if m.lower() in out.lower():
+                    return m
+        return "Unknown"
+
+    @staticmethod
+    def set_gpu_mode(mode):
+        out, err, rc = _run(f"supergfxctl -m {mode}")
+        return rc == 0, err or out
+
 
 # ---------------------------------------------------------------------------
 # Background status refresh thread
@@ -124,6 +138,7 @@ class StatusWorker(QThread):
             "profile": Backend.get_profile(),
             "kbd":     Backend.get_kbd_brightness(),
             "battery": Backend.get_battery(),
+            "gpu":     Backend.get_gpu_mode(),
         })
 
 
@@ -309,6 +324,16 @@ class MainWindow(QWidget):
         gl.addStretch()
         root.addWidget(g)
 
+        # GPU Mode
+        g = QGroupBox("GPU Mode")
+        gl = QHBoxLayout(g)
+        self._gpu = _ButtonRow(["Integrated", "Hybrid", "Dedicated"])
+        self._gpu_note = QLabel("(logout required)")
+        self._gpu_note.setStyleSheet("color: #475569; font-size: 10px;")
+        gl.addWidget(self._gpu)
+        gl.addWidget(self._gpu_note)
+        root.addWidget(g)
+
         # Battery
         g = QGroupBox("Battery")
         gl = QVBoxLayout(g)
@@ -350,6 +375,9 @@ class MainWindow(QWidget):
         self._slash_on_btn.clicked.connect(lambda: self._do_slash(True))
         self._slash_off_btn.clicked.connect(lambda: self._do_slash(False))
 
+        for name, btn in self._gpu.buttons.items():
+            btn.clicked.connect(lambda _, n=name: self._do_gpu(n))
+
         for name, btn in self._bat_limit.buttons.items():
             pct = int(name.replace("%", ""))
             btn.clicked.connect(lambda _, p=pct: self._do_limit(p))
@@ -373,6 +401,11 @@ class MainWindow(QWidget):
     def _do_slash(self, enabled):
         ok, msg = Backend.set_slash(enabled)
         self._set_status(f"Slash LED → {'On' if enabled else 'Off'}" if ok else f"Error: {msg[:70]}",
+                         "#0ea5e9" if ok else "#ef4444")
+
+    def _do_gpu(self, mode):
+        ok, msg = Backend.set_gpu_mode(mode)
+        self._set_status(f"GPU → {mode} (logout to apply)" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
 
     def _do_limit(self, limit):
@@ -402,6 +435,7 @@ class MainWindow(QWidget):
 
         self._profile.set_active(profile)
         self._kbd.set_active(kbd)
+        self._gpu.set_active(s.get("gpu", "Unknown"))
 
         cap = bat.get("capacity", 0)
         self._bat_bar.setValue(cap)
