@@ -24,7 +24,8 @@
       "Read(//sys/bus/platform/drivers/asus-nb-wmi/**)",
       "Bash(kill:*)",
       "Bash(which gnome-session-quit:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(cd:*)"
     ]
   }
 }
