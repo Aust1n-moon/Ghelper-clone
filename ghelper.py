@@ -4,8 +4,16 @@ G-Helper Clone — ASUS ROG Zephyrus G14 2024 (GA403) control panel for Fedora L
 """
 
 import sys
-import os
+import json
 import subprocess
+import glob as _glob
+import collections
+from pathlib import Path
+try:
+    import dbus as _dbus
+    _DBUS_OK = True
+except ImportError:
+    _DBUS_OK = False
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QButtonGroup, QGroupBox, QSystemTrayIcon,
@@ -16,7 +24,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
 
 
 # ---------------------------------------------------------------------------
-# Backend: thin wrappers around asusctl / sysfs
+# Backend: thin wrappers around asusctl / sysfs / xrandr
 # ---------------------------------------------------------------------------
 
 def _run(cmd, timeout=8):
@@ -33,6 +41,41 @@ def _sysfs(path):
             return f.read().strip()
     except Exception:
         return None
+
+
+# 12 samples × 5 s refresh = 60 s rolling window for power draw average
+_power_samples: collections.deque = collections.deque(maxlen=12)
+
+# ---------------------------------------------------------------------------
+# Persistent settings
+# ---------------------------------------------------------------------------
+
+_CONFIG_PATH = Path.home() / ".config" / "ghelper.json"
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_setting(key: str, value) -> None:
+    s = _load_settings()
+    s[key] = value
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_CONFIG_PATH, "w") as f:
+            json.dump(s, f, indent=2)
+    except Exception:
+        pass
+
+FAN_PRESETS = {
+    "Silent":   "30c:0%,40c:0%,50c:10%,60c:25%,70c:40%,80c:55%,90c:70%,100c:85%",
+    "Balanced": "30c:0%,40c:10%,55c:20%,65c:35%,75c:50%,85c:65%,95c:80%,105c:100%",
+    "Turbo":    "30c:25%,40c:35%,50c:45%,60c:58%,70c:72%,80c:85%,90c:93%,100c:100%",
+}
 
 
 class Backend:
@@ -82,22 +125,27 @@ class Backend:
             "capacity": int(cap_raw),
         }
 
-        current_now  = _sysfs(f"{base}/current_now")
-        voltage_now  = _sysfs(f"{base}/voltage_now")
-        charge_now   = _sysfs(f"{base}/charge_now")
-        charge_full  = _sysfs(f"{base}/charge_full")
+        current_now   = _sysfs(f"{base}/current_now")
+        voltage_now   = _sysfs(f"{base}/voltage_now")
+        charge_now    = _sysfs(f"{base}/charge_now")
+        charge_full   = _sysfs(f"{base}/charge_full")
         charge_design = _sysfs(f"{base}/charge_full_design")
-        charge_limit = _sysfs(f"{base}/charge_control_end_threshold")
+        charge_limit  = _sysfs(f"{base}/charge_control_end_threshold")
 
         if current_now and voltage_now:
-            amps = int(current_now) / 1_000_000
+            amps  = int(current_now) / 1_000_000
             volts = int(voltage_now) / 1_000_000
             power_w = round(amps * volts, 1)
             if power_w > 0:
                 info["power_w"] = power_w
-                if charge_now and voltage_now:
+                _power_samples.append(power_w)
+                if len(_power_samples) >= 3:
+                    avg = round(sum(_power_samples) / len(_power_samples), 1)
+                    info["power_w_avg"] = avg
+                avg_power = info.get("power_w_avg", power_w)
+                if charge_now and avg_power > 0:
                     wh_remaining = int(charge_now) / 1_000_000 * volts
-                    info["time_h"] = round(wh_remaining / (amps * volts), 1)
+                    info["time_h"] = round(wh_remaining / avg_power, 1)
 
         if charge_full and charge_design and int(charge_design) > 0:
             info["health"] = round(int(charge_full) * 100 / int(charge_design), 1)
@@ -126,9 +174,143 @@ class Backend:
         out, err, rc = _run(f"supergfxctl -m {mode}", timeout=60)
         return rc == 0, err or out
 
+    @staticmethod
+    def get_temps():
+        temps = {}
+        for hwmon_path in _glob.glob("/sys/class/hwmon/hwmon*"):
+            name = _sysfs(f"{hwmon_path}/name")
+            if name == "k10temp":
+                # Tdie (temp2) preferred; fall back to Tctl (temp1)
+                t = _sysfs(f"{hwmon_path}/temp2_input") or _sysfs(f"{hwmon_path}/temp1_input")
+                if t:
+                    temps["cpu"] = int(t) // 1000
+            elif name == "amdgpu":
+                t = _sysfs(f"{hwmon_path}/temp1_input")  # edge temp
+                if t:
+                    # First amdgpu = iGPU, second = dGPU (when active)
+                    key = "gpu2" if "gpu" in temps else "gpu"
+                    temps[key] = int(t) // 1000
+        return temps
+
+    @staticmethod
+    def set_fan_preset(preset):
+        data = FAN_PRESETS.get(preset)
+        if not data:
+            return False, "Unknown preset"
+        profile = Backend.get_profile()
+        if profile == "Unknown":
+            return False, "Could not detect current profile"
+        _run(f"asusctl fan-curve --mod-profile {profile} --enable-fan-curves true")
+        errors = []
+        for fan in ("cpu", "gpu", "mid"):
+            _, err, rc = _run(
+                f"asusctl fan-curve --mod-profile {profile} --fan {fan} --data '{data}'"
+            )
+            if rc != 0 and "not supported" not in err.lower() and "no fan" not in err.lower():
+                errors.append(f"{fan}: {err[:40]}")
+        return len(errors) == 0, "; ".join(errors)
+
+    @staticmethod
+    def _mutter():
+        if not _DBUS_OK:
+            return None
+        try:
+            bus = _dbus.SessionBus()
+            proxy = bus.get_object("org.gnome.Mutter.DisplayConfig",
+                                   "/org/gnome/Mutter/DisplayConfig")
+            return _dbus.Interface(proxy, "org.gnome.Mutter.DisplayConfig")
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_display_info():
+        iface = Backend._mutter()
+        if not iface:
+            return None
+        try:
+            _, monitors, _, _ = iface.GetCurrentState()
+            for monitor_id, modes, mon_props in monitors:
+                if not mon_props.get("is-builtin", False):
+                    continue
+                current_rate = None
+                cur_w = cur_h = None
+                for _, width, height, refresh, _, _, mode_props in modes:
+                    if mode_props.get("is-current", False):
+                        current_rate = float(refresh)
+                        cur_w, cur_h = int(width), int(height)
+                        break
+                max_rate = max(
+                    float(r) for _, w, h, r, _, _, _ in modes
+                    if int(w) == cur_w and int(h) == cur_h
+                ) if cur_w else None
+                return {"output": str(monitor_id[0]),
+                        "current_rate": current_rate,
+                        "max_rate": max_rate}
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def set_refresh_rate(hz):
+        iface = Backend._mutter()
+        if not iface:
+            return False, "python3-dbus unavailable"
+        try:
+            serial, monitors, logical_monitors, _ = iface.GetCurrentState()
+
+            # Build per-connector info
+            conn_info = {}
+            for monitor_id, modes, mon_props in monitors:
+                connector = str(monitor_id[0])
+                is_builtin = bool(mon_props.get("is-builtin", False))
+                cur_mode_id = cur_w = cur_h = None
+                all_modes = []
+                for mode_id, w, h, r, _, _, mode_props in modes:
+                    all_modes.append((str(mode_id), int(w), int(h), float(r)))
+                    if mode_props.get("is-current", False):
+                        cur_mode_id = str(mode_id)
+                        cur_w, cur_h = int(w), int(h)
+                conn_info[connector] = {
+                    "cur_mode_id": cur_mode_id,
+                    "modes": all_modes,
+                    "is_builtin": is_builtin,
+                    "cur_res": (cur_w, cur_h),
+                }
+
+            new_lms = []
+            for lm in logical_monitors:
+                x, y = int(lm[0]), int(lm[1])
+                scale, transform, is_primary = float(lm[2]), int(lm[3]), bool(lm[4])
+                new_mons = []
+                for lm_mon_id in lm[5]:
+                    connector = str(lm_mon_id[0])
+                    info = conn_info.get(connector, {})
+                    target = info.get("cur_mode_id", "")
+                    cur_w, cur_h = info.get("cur_res", (None, None))
+                    if info.get("is_builtin") and cur_w:
+                        best, best_diff = None, float("inf")
+                        for mode_id, w, h, r in info["modes"]:
+                            if w == cur_w and h == cur_h:
+                                d = abs(r - hz)
+                                if d < best_diff:
+                                    best_diff, best = d, mode_id
+                        if best:
+                            target = best
+                    new_mons.append((connector, target, _dbus.Dictionary({}, signature="sv")))
+                new_lms.append((_dbus.Int32(x), _dbus.Int32(y), _dbus.Double(scale),
+                                _dbus.UInt32(transform), _dbus.Boolean(is_primary), new_mons))
+
+            iface.ApplyMonitorsConfig(
+                _dbus.UInt32(int(serial)), _dbus.UInt32(1),
+                new_lms, _dbus.Dictionary({}, signature="sv")
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)[:80]
+
 
 # ---------------------------------------------------------------------------
-# Background status refresh thread
+# Background workers
 # ---------------------------------------------------------------------------
 
 class StatusWorker(QThread):
@@ -140,11 +322,13 @@ class StatusWorker(QThread):
             "kbd":     Backend.get_kbd_brightness(),
             "battery": Backend.get_battery(),
             "gpu":     Backend.get_gpu_mode(),
+            "temps":   Backend.get_temps(),
+            "display": Backend.get_display_info(),
         })
 
 
 class GpuSwitchWorker(QThread):
-    done = pyqtSignal(bool, str, str)  # ok, msg, mode
+    done = pyqtSignal(bool, str, str)
 
     def __init__(self, mode):
         super().__init__()
@@ -156,7 +340,7 @@ class GpuSwitchWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# UI helpers
 # ---------------------------------------------------------------------------
 
 def _make_icon(letter="G", bg="#2563eb", size=64):
@@ -280,11 +464,14 @@ class MainWindow(QWidget):
             Qt.WindowType.WindowTitleHint |
             Qt.WindowType.WindowCloseButtonHint
         )
+        self._last_ac_status = None
+        self._native_rate = None
         self._build_ui()
         self._connect()
         self._worker = None
         self._gpu_worker = None
         self._gpu_pending = None
+        self._restore_settings()
         self._schedule_refresh()
 
     # ------------------------------------------------------------------ UI build
@@ -310,11 +497,28 @@ class MainWindow(QWidget):
         sep.setStyleSheet("color: #1e293b; margin: 2px 0;")
         root.addWidget(sep)
 
+        # Temperatures
+        g = QGroupBox("Temperatures")
+        gl = QHBoxLayout(g)
+        self._cpu_temp = QLabel("CPU  --°C")
+        self._gpu_temp = QLabel("GPU  --°C")
+        self._gpu2_temp = QLabel("")
+        for lbl in (self._cpu_temp, self._gpu_temp, self._gpu2_temp):
+            lbl.setStyleSheet("font-size: 12px; color: #94a3b8;")
+        gl.addWidget(self._cpu_temp)
+        gl.addStretch()
+        gl.addWidget(self._gpu_temp)
+        gl.addWidget(self._gpu2_temp)
+        root.addWidget(g)
+
         # Profile
         g = QGroupBox("Performance Profile")
         gl = QVBoxLayout(g)
         self._profile = _ButtonRow(["LowPower", "Balanced", "Performance"])
         gl.addWidget(self._profile)
+        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display)")
+        self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        gl.addWidget(self._auto_switch)
         root.addWidget(g)
 
         # GPU Mode
@@ -325,6 +529,23 @@ class MainWindow(QWidget):
         self._gpu_auto_restart = QCheckBox("Auto restart session after switch")
         self._gpu_auto_restart.setStyleSheet("color: #94a3b8; font-size: 11px;")
         gl.addWidget(self._gpu_auto_restart)
+        root.addWidget(g)
+
+        # Fan Curve
+        g = QGroupBox("Fan Curve")
+        gl = QVBoxLayout(g)
+        self._fan = _ButtonRow(["Silent", "Balanced", "Turbo"])
+        gl.addWidget(self._fan)
+        root.addWidget(g)
+
+        # Display
+        g = QGroupBox("Display")
+        gl = QHBoxLayout(g)
+        lbl = QLabel("Refresh rate:")
+        lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        self._refresh_rate = _ButtonRow(["60 Hz", "Native"])
+        gl.addWidget(lbl)
+        gl.addWidget(self._refresh_rate)
         root.addWidget(g)
 
         # Keyboard
@@ -355,7 +576,7 @@ class MainWindow(QWidget):
         bar_row = QHBoxLayout()
         self._bat_bar  = QProgressBar()
         self._bat_info = QLabel("")
-        self._bat_info.setStyleSheet("color: #64748b; font-size: 11px; min-width: 130px;")
+        self._bat_info.setStyleSheet("color: #64748b; font-size: 11px; min-width: 140px;")
         bar_row.addWidget(self._bat_bar)
         bar_row.addWidget(self._bat_info)
         gl.addLayout(bar_row)
@@ -397,6 +618,12 @@ class MainWindow(QWidget):
             pct = int(name.replace("%", ""))
             btn.clicked.connect(lambda _, p=pct: self._do_limit(p))
 
+        for name, btn in self._fan.buttons.items():
+            btn.clicked.connect(lambda _, n=name: self._do_fan(n))
+
+        self._refresh_rate.buttons["60 Hz"].clicked.connect(lambda: self._do_refresh(60))
+        self._refresh_rate.buttons["Native"].clicked.connect(lambda: self._do_refresh(None))
+
     # ---------------------------------------------------------------- actions
 
     def _set_status(self, msg, color="#334155"):
@@ -410,11 +637,15 @@ class MainWindow(QWidget):
 
     def _do_kbd(self, level):
         ok, msg = Backend.set_kbd_brightness(level)
+        if ok:
+            _save_setting("kbd", level)
         self._set_status(f"Keyboard → {level}" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
 
     def _do_slash(self, enabled):
         ok, msg = Backend.set_slash(enabled)
+        if ok:
+            _save_setting("slash", enabled)
         self._set_status(f"Slash LED → {'On' if enabled else 'Off'}" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
 
@@ -451,6 +682,89 @@ class MainWindow(QWidget):
         self._set_status(f"Charge limit → {limit}%" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
 
+    def _do_fan(self, preset):
+        self._set_status(f"Applying fan curve: {preset}…", "#f59e0b")
+        ok, msg = Backend.set_fan_preset(preset)
+        if ok:
+            _save_setting("fan_preset", preset)
+        self._set_status(f"Fan curve → {preset}" if ok else f"Fan curve error: {msg[:60]}",
+                         "#0ea5e9" if ok else "#ef4444")
+
+    def _do_refresh(self, hz):
+        if hz is None:
+            hz = self._native_rate
+        if hz is None:
+            self._set_status("Native rate unknown — wait for first refresh", "#f59e0b")
+            return
+        ok, msg = Backend.set_refresh_rate(hz)
+        self._set_status(f"Refresh → {hz} Hz" if ok else f"Error: {msg[:70]}",
+                         "#0ea5e9" if ok else "#ef4444")
+
+    def _check_ac_auto_switch(self, bat_status):
+        prev = self._last_ac_status
+        self._last_ac_status = bat_status
+        if not self._auto_switch.isChecked() or prev is None:
+            return
+        on_ac       = {"Charging", "Full", "Not charging"}
+        was_on_ac   = prev in on_ac
+        now_battery = bat_status == "Discharging"
+        was_battery = prev == "Discharging"
+        now_on_ac   = bat_status in on_ac
+
+        if was_on_ac and now_battery:
+            # Battery: LowPower profile + Integrated GPU + Silent fan + 60 Hz
+            Backend.set_profile("LowPower")
+            self._profile.set_active("LowPower")
+            Backend.set_fan_preset("Silent")
+            self._fan.set_active("Silent")
+            self._do_refresh(60)
+            self._refresh_rate.set_active("60 Hz")
+            cur_gpu = Backend.get_gpu_mode()
+            if cur_gpu != "Integrated":
+                self._set_status("Unplugged → LowPower · switching GPU to Integrated…", "#f59e0b")
+                self._do_gpu("Integrated")
+            else:
+                self._set_status("Unplugged → LowPower · Integrated · Silent · 60 Hz", "#f59e0b")
+
+        elif was_battery and now_on_ac:
+            # AC: Balanced profile + Hybrid GPU + Balanced fan + Native refresh
+            Backend.set_profile("Balanced")
+            self._profile.set_active("Balanced")
+            Backend.set_fan_preset("Balanced")
+            self._fan.set_active("Balanced")
+            self._do_refresh(None)  # Native
+            self._refresh_rate.set_active("Native")
+            cur_gpu = Backend.get_gpu_mode()
+            if cur_gpu != "Hybrid":
+                self._set_status("Plugged in → Balanced · switching GPU to Hybrid…", "#0ea5e9")
+                self._do_gpu("Hybrid")
+            else:
+                self._set_status("Plugged in → Balanced · Hybrid · Balanced · Native", "#0ea5e9")
+
+    # ---------------------------------------------------------------- restore saved settings
+
+    def _restore_settings(self):
+        s = _load_settings()
+
+        fan = s.get("fan_preset")
+        if fan and fan in self._fan.buttons:
+            self._fan.set_active(fan)
+            # Re-apply in background so fan curve survives reboots
+            import threading
+            threading.Thread(target=Backend.set_fan_preset, args=(fan,), daemon=True).start()
+
+        kbd = s.get("kbd")
+        if kbd and kbd in self._kbd.buttons:
+            # Pre-select while waiting for first status poll
+            self._kbd.set_active(kbd)
+
+        slash = s.get("slash")
+        if slash is not None:
+            if slash:
+                self._slash_on_btn.setChecked(True)
+            else:
+                self._slash_off_btn.setChecked(True)
+
     # ---------------------------------------------------------------- status refresh
 
     def _schedule_refresh(self):
@@ -470,15 +784,39 @@ class MainWindow(QWidget):
         profile = s.get("profile", "Unknown")
         kbd     = s.get("kbd", "Unknown")
         bat     = s.get("battery", {})
+        temps   = s.get("temps", {})
+        display = s.get("display")
 
         self._profile.set_active(profile)
         self._kbd.set_active(kbd)
         self._gpu.set_active(self._gpu_pending or s.get("gpu", "Unknown"))
 
+        # Temperatures
+        def _temp_color(t):
+            if t >= 85: return "#ef4444"
+            if t >= 70: return "#f59e0b"
+            return "#22c55e"
+
+        if "cpu" in temps:
+            t = temps["cpu"]
+            self._cpu_temp.setText(f"CPU  {t}°C")
+            self._cpu_temp.setStyleSheet(f"font-size: 12px; color: {_temp_color(t)};")
+        if "gpu" in temps:
+            t = temps["gpu"]
+            self._gpu_temp.setText(f"GPU  {t}°C")
+            self._gpu_temp.setStyleSheet(f"font-size: 12px; color: {_temp_color(t)};")
+        if "gpu2" in temps:
+            t = temps["gpu2"]
+            self._gpu2_temp.setText(f"dGPU  {t}°C")
+            self._gpu2_temp.setStyleSheet(f"font-size: 12px; color: {_temp_color(t)};")
+
+        # Battery
         cap = bat.get("capacity", 0)
         self._bat_bar.setValue(cap)
         parts = [bat.get("status", "")]
-        if "power_w" in bat:
+        if "power_w_avg" in bat:
+            parts.append(f"{bat['power_w_avg']} W")
+        elif "power_w" in bat:
             parts.append(f"{bat['power_w']} W")
         if "time_h" in bat:
             parts.append(f"~{bat['time_h']} h")
@@ -495,7 +833,21 @@ class MainWindow(QWidget):
             f"QProgressBar::chunk {{ background-color: {chunk}; border-radius: 3px; }}"
         )
 
+        # Display refresh rate
+        if display and display.get("current_rate"):
+            cr = display["current_rate"]
+            mr = display.get("max_rate", cr)
+            if mr and (self._native_rate is None or mr > self._native_rate):
+                self._native_rate = mr
+            if abs(cr - 60) < 1:
+                self._refresh_rate.set_active("60 Hz")
+            else:
+                self._refresh_rate.set_active("Native")
+
         self._hdr_status.setText(f"{profile}  ·  {cap}%")
+
+        # AC/DC auto profile switch
+        self._check_ac_auto_switch(bat.get("status", "Unknown"))
 
     # ---------------------------------------------------------------- close → hide
 
