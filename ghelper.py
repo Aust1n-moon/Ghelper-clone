@@ -776,6 +776,11 @@ class MainWindow(QWidget):
             else:
                 self._slash_off_btn.setChecked(True)
 
+        # Default to 60 Hz on launch
+        self._refresh_rate.set_active("60 Hz")
+        import threading
+        threading.Thread(target=Backend.set_refresh_rate, args=(60,), daemon=True).start()
+
     # ---------------------------------------------------------------- status refresh
 
     def _schedule_refresh(self):
