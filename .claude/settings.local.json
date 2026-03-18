@@ -27,7 +27,8 @@
       "Bash(echo:*)",
       "Bash(cd:*)",
       "Bash(update-desktop-database:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(systemctl:*)"
     ]
   }
 }

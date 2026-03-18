@@ -159,6 +159,18 @@ class Backend:
         return info
 
     @staticmethod
+    def get_ac_online():
+        """Return True if AC adapter is physically connected, False otherwise.
+        Reads the sysfs 'online' file for any Mains-type power supply."""
+        for ps_path in _glob.glob("/sys/class/power_supply/*"):
+            ps_type = _sysfs(f"{ps_path}/type")
+            if ps_type == "Mains":
+                online = _sysfs(f"{ps_path}/online")
+                if online is not None:
+                    return online.strip() == "1"
+        return None  # unknown
+
+    @staticmethod
     def set_charge_limit(limit):
         out, err, rc = _run(f"asusctl battery limit {limit}")
         return rc == 0, err or out
@@ -706,15 +718,25 @@ class MainWindow(QWidget):
                          "#0ea5e9" if ok else "#ef4444")
 
     def _check_ac_auto_switch(self, bat_status):
+        # Use the AC adapter online file as the authoritative source to avoid
+        # false transitions caused by "Not charging" appearing on battery
+        # (e.g. when at/above the charge limit on ASUS ROG laptops).
+        ac_online = Backend.get_ac_online()
+        if ac_online is not None:
+            current_on_ac = ac_online
+        else:
+            on_ac_statuses = {"Charging", "Full", "Not charging"}
+            current_on_ac = bat_status in on_ac_statuses
+
         prev = self._last_ac_status
-        self._last_ac_status = bat_status
+        self._last_ac_status = current_on_ac
         if not self._auto_switch.isChecked() or prev is None:
             return
-        on_ac       = {"Charging", "Full", "Not charging"}
-        was_on_ac   = prev in on_ac
-        now_battery = bat_status == "Discharging"
-        was_battery = prev == "Discharging"
-        now_on_ac   = bat_status in on_ac
+
+        was_on_ac   = prev is True
+        now_battery = current_on_ac is False
+        was_battery = prev is False
+        now_on_ac   = current_on_ac is True
 
         if was_on_ac and now_battery:
             # Battery: LowPower profile + Integrated GPU + Silent fan + 60 Hz
@@ -893,7 +915,12 @@ class GHelperApp:
 
         self.win = MainWindow()
         self._build_tray()
+        self.app.aboutToQuit.connect(self._on_quit)
         self.win.show()
+
+    def _on_quit(self):
+        # Set GPU to Integrated on exit so the next boot starts without the dGPU.
+        Backend.set_gpu_mode("Integrated")
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(_make_icon(), self.app)
