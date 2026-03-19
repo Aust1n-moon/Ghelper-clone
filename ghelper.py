@@ -682,6 +682,7 @@ class MainWindow(QWidget):
             self._set_status(f"Error: {msg[:70]}", "#ef4444")
             return
         self._gpu_pending = mode
+        _save_setting("gpu", mode)
         if self._gpu_auto_restart.isChecked():
             self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
             QTimer.singleShot(1500, lambda: _run(
@@ -790,6 +791,13 @@ class MainWindow(QWidget):
         if kbd and kbd in self._kbd.buttons:
             # Pre-select while waiting for first status poll
             self._kbd.set_active(kbd)
+
+        gpu = s.get("gpu", "Integrated")
+        if gpu not in self._gpu.buttons:
+            gpu = "Integrated"
+        self._gpu.set_active(gpu)
+        import threading
+        threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
 
         slash = s.get("slash")
         if slash is not None:
