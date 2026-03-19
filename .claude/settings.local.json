@@ -28,7 +28,21 @@
       "Bash(cd:*)",
       "Bash(update-desktop-database:*)",
       "Bash(git:*)",
-      "Bash(systemctl:*)"
+      "Bash(systemctl:*)",
+      "Read(//home/atm/.config/**)",
+      "Bash(fastfetch --list-config-paths)",
+      "Bash(fastfetch --help)",
+      "Bash(fastfetch --gpu-hide-type help)",
+      "Bash(supergfxctl:*)",
+      "Bash(fastfetch --gpu-hide-type discrete)",
+      "Bash(~/.local/bin/fastfetch)",
+      "Bash(lspci)",
+      "Bash(xargs -I{} sh -c \"cat /sys/bus/pci/devices/{}/vendor 2>/dev/null | grep -q \"\"0x10de\"\" && echo {}\")",
+      "Read(//sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/power/**)",
+      "Read(//sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/**)",
+      "Bash(cat /etc/sudoers.d/*)",
+      "Bash(sudo cp:*)",
+      "Bash(sudo chmod:*)"
     ]
   }
 }
