@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+cla#!/usr/bin/env bash
 # G-Helper install script for Fedora Linux
 set -e
 

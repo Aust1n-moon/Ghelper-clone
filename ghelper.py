@@ -20,7 +20,7 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QButtonGroup, QGroupBox, QSystemTrayIcon,
-    QMenu, QFrame, QProgressBar, QCheckBox,
+    QMenu, QFrame, QProgressBar, QCheckBox, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
@@ -128,27 +128,36 @@ class Backend:
             "capacity": int(cap_raw),
         }
 
-        current_now   = _sysfs(f"{base}/current_now")
-        voltage_now   = _sysfs(f"{base}/voltage_now")
         charge_now    = _sysfs(f"{base}/charge_now")
         charge_full   = _sysfs(f"{base}/charge_full")
         charge_design = _sysfs(f"{base}/charge_full_design")
         charge_limit  = _sysfs(f"{base}/charge_control_end_threshold")
 
-        if current_now and voltage_now:
-            amps  = int(current_now) / 1_000_000
-            volts = int(voltage_now) / 1_000_000
-            power_w = round(amps * volts, 1)
-            if power_w > 0:
-                info["power_w"] = power_w
-                _power_samples.append(power_w)
-                if len(_power_samples) >= 3:
-                    avg = round(sum(_power_samples) / len(_power_samples), 1)
-                    info["power_w_avg"] = avg
-                avg_power = info.get("power_w_avg", power_w)
-                if charge_now and avg_power > 0:
-                    wh_remaining = int(charge_now) / 1_000_000 * volts
-                    info["time_h"] = round(wh_remaining / avg_power, 1)
+        # Power consumption: prefer power_now (direct), fall back to current*voltage
+        # (same approach as auto-cpufreq)
+        power_now = _sysfs(f"{base}/power_now")
+        if power_now and power_now.isdigit():
+            power_w = round(int(power_now) / 1_000_000, 1)
+        else:
+            current_now = _sysfs(f"{base}/current_now")
+            voltage_now = _sysfs(f"{base}/voltage_now")
+            if current_now and current_now.isdigit() and voltage_now and voltage_now.isdigit():
+                power_w = round((int(current_now) * int(voltage_now)) / 1_000_000_000_000, 1)
+            else:
+                power_w = 0.0
+
+        if power_w > 0:
+            info["power_w"] = power_w
+            _power_samples.append(power_w)
+            if len(_power_samples) >= 3:
+                avg = round(sum(_power_samples) / len(_power_samples), 1)
+                info["power_w_avg"] = avg
+            avg_power = info.get("power_w_avg", power_w)
+            voltage_now_raw = _sysfs(f"{base}/voltage_now")
+            if charge_now and voltage_now_raw and avg_power > 0:
+                volts = int(voltage_now_raw) / 1_000_000
+                wh_remaining = int(charge_now) / 1_000_000 * volts
+                info["time_h"] = round(wh_remaining / avg_power, 1)
 
         if charge_full and charge_design and int(charge_design) > 0:
             info["health"] = round(int(charge_full) * 100 / int(charge_design), 1)
@@ -174,6 +183,63 @@ class Backend:
     def set_charge_limit(limit):
         out, err, rc = _run(f"asusctl battery limit {limit}")
         return rc == 0, err or out
+
+    @staticmethod
+    def get_brightness():
+        if not _DBUS_OK:
+            return None
+        try:
+            bus = _dbus.SessionBus()
+            proxy = bus.get_object("org.gnome.SettingsDaemon.Power",
+                                   "/org/gnome/SettingsDaemon/Power")
+            iface = _dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+            return int(iface.Get("org.gnome.SettingsDaemon.Power.Screen", "Brightness"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def set_brightness(pct: int):
+        if not _DBUS_OK:
+            return False, "python3-dbus unavailable"
+        try:
+            bus = _dbus.SessionBus()
+            proxy = bus.get_object("org.gnome.SettingsDaemon.Power",
+                                   "/org/gnome/SettingsDaemon/Power")
+            iface = _dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+            iface.Set("org.gnome.SettingsDaemon.Power.Screen", "Brightness",
+                      _dbus.Int32(max(1, min(100, pct))))
+            return True, ""
+        except Exception as e:
+            return False, str(e)[:80]
+
+    @staticmethod
+    def set_epp(pref: str):
+        out, err, rc = _run(f"pkexec /usr/local/bin/ghelper-power epp {pref}", timeout=15)
+        return rc == 0, err or out
+
+    @staticmethod
+    def get_epp():
+        val = _sysfs("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
+        return val or "unknown"
+
+    @staticmethod
+    def apply_power_mode(mode: str, epp: str = ""):
+        """Apply full battery or AC power profile via polkit helper.
+        mode: 'battery' or 'ac'
+        epp: optional EPP override (e.g. 'power', 'balance_power')
+        """
+        cmd = f"pkexec /usr/local/bin/ghelper-power {mode}"
+        if epp:
+            cmd += f" {epp}"
+        out, err, rc = _run(cmd, timeout=20)
+        return rc == 0, err or out
+
+    @staticmethod
+    def get_cpu_boost():
+        val = _sysfs("/sys/devices/system/cpu/cpufreq/boost")
+        if val is None:
+            return None
+        return val == "1"
 
     @staticmethod
     def get_gpu_mode():
@@ -333,12 +399,14 @@ class StatusWorker(QThread):
 
     def run(self):
         self.done.emit({
-            "profile": Backend.get_profile(),
-            "kbd":     Backend.get_kbd_brightness(),
-            "battery": Backend.get_battery(),
-            "gpu":     Backend.get_gpu_mode(),
-            "temps":   Backend.get_temps(),
-            "display": Backend.get_display_info(),
+            "profile":   Backend.get_profile(),
+            "kbd":       Backend.get_kbd_brightness(),
+            "battery":   Backend.get_battery(),
+            "gpu":       Backend.get_gpu_mode(),
+            "temps":     Backend.get_temps(),
+            "display":   Backend.get_display_info(),
+            "epp":       Backend.get_epp(),
+            "cpu_boost": Backend.get_cpu_boost(),
         })
 
 
@@ -493,10 +561,14 @@ class MainWindow(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setSpacing(6)
-        root.setContentsMargins(12, 12, 12, 10)
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        # Header
+        # Fixed header (outside scroll area)
+        hdr_widget = QWidget()
+        hdr_layout = QVBoxLayout(hdr_widget)
+        hdr_layout.setContentsMargins(12, 12, 12, 4)
+        hdr_layout.setSpacing(4)
         hdr = QHBoxLayout()
         title = QLabel("G-Helper")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #38bdf8; letter-spacing: 1px;")
@@ -505,12 +577,36 @@ class MainWindow(QWidget):
         hdr.addWidget(title)
         hdr.addStretch()
         hdr.addWidget(self._hdr_status)
-        root.addLayout(hdr)
-
+        hdr_layout.addLayout(hdr)
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color: #1e293b; margin: 2px 0;")
-        root.addWidget(sep)
+        hdr_layout.addWidget(sep)
+        root.addWidget(hdr_widget)
+
+        # Scrollable content area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollBar:vertical { width: 6px; background: #0f172a; }"
+                             "QScrollBar::handle:vertical { background: #1e293b; border-radius: 3px; }"
+                             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }")
+        content = QWidget()
+        root_inner = QVBoxLayout(content)
+        root_inner.setSpacing(6)
+        root_inner.setContentsMargins(12, 6, 12, 4)
+        scroll.setWidget(content)
+        root.addWidget(scroll)
+
+        # Status bar (fixed at bottom, outside scroll)
+        self._status = QLabel("Ready")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setStyleSheet("color: #334155; font-size: 11px; padding: 4px; background: #000;")
+        root.addWidget(self._status)
+
+        # From here all widgets go into root_inner (the scrollable area)
+        root = root_inner
 
         # Temperatures
         g = QGroupBox("Temperatures")
@@ -531,9 +627,34 @@ class MainWindow(QWidget):
         gl = QVBoxLayout(g)
         self._profile = _ButtonRow(["LowPower", "Balanced", "Performance"])
         gl.addWidget(self._profile)
-        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display)")
+        epp_row = QHBoxLayout()
+        epp_lbl = QLabel("EPP:")
+        epp_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        self._epp = _ButtonRow(["LowPower", "Balanced", "Performance"])
+        epp_row.addWidget(epp_lbl)
+        epp_row.addWidget(self._epp)
+        gl.addLayout(epp_row)
+        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · EPP · fan · display · kbd · slash)")
         self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
         gl.addWidget(self._auto_switch)
+        root.addWidget(g)
+
+        # Power Tweaks
+        g = QGroupBox("Power Tweaks")
+        gl = QVBoxLayout(g)
+        pm_row = QHBoxLayout()
+        pm_lbl = QLabel("Mode:")
+        pm_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        self._power_mode = _ButtonRow(["Battery", "AC"])
+        pm_row.addWidget(pm_lbl)
+        pm_row.addWidget(self._power_mode)
+        gl.addLayout(pm_row)
+        self._boost_label = QLabel("CPU Boost: –")
+        self._boost_label.setStyleSheet("color: #475569; font-size: 10px;")
+        self._aspm_label = QLabel("ASPM · writeback · NMI · PCI-PM · WiFi-PS · USB · GPU-DPM · freq-cap")
+        self._aspm_label.setStyleSheet("color: #334155; font-size: 10px;")
+        gl.addWidget(self._boost_label)
+        gl.addWidget(self._aspm_label)
         root.addWidget(g)
 
         # GPU Mode
@@ -608,12 +729,6 @@ class MainWindow(QWidget):
         gl.addWidget(self._bat_health)
         root.addWidget(g)
 
-        # Status bar
-        self._status = QLabel("Ready")
-        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._status.setStyleSheet("color: #334155; font-size: 11px; padding: 2px;")
-        root.addWidget(self._status)
-
     # ---------------------------------------------------------------- connect signals
 
     def _connect(self):
@@ -639,16 +754,40 @@ class MainWindow(QWidget):
         self._refresh_rate.buttons["60 Hz"].clicked.connect(lambda: self._do_refresh(60))
         self._refresh_rate.buttons["Native"].clicked.connect(lambda: self._do_refresh(None))
 
+        for name, btn in self._epp.buttons.items():
+            btn.clicked.connect(lambda _, n=name: self._do_epp(n))
+
+        self._power_mode.buttons["Battery"].clicked.connect(lambda: self._do_power_mode("battery"))
+        self._power_mode.buttons["AC"].clicked.connect(lambda: self._do_power_mode("ac"))
+
     # ---------------------------------------------------------------- actions
 
     def _set_status(self, msg, color="#334155"):
         self._status.setText(msg)
         self._status.setStyleSheet(f"color: {color}; font-size: 11px; padding: 2px;")
 
+    def _is_battery_mode_active(self):
+        """Battery optimizations only apply when LowPower profile + Integrated GPU."""
+        profile_ok = self._profile.buttons.get("LowPower") and \
+                     self._profile.buttons["LowPower"].isChecked()
+        gpu_ok = self._gpu.buttons.get("Integrated") and \
+                 self._gpu.buttons["Integrated"].isChecked()
+        return bool(profile_ok and gpu_ok)
+
+    def _sync_power_mode(self):
+        """Apply battery or AC tweaks based on current profile + GPU selection."""
+        if self._is_battery_mode_active():
+            self._do_power_mode("battery")
+            self._power_mode.set_active("Battery")
+        else:
+            self._do_power_mode("ac")
+            self._power_mode.set_active("AC")
+
     def _do_profile(self, profile):
         ok, msg = Backend.set_profile(profile)
         if ok:
             _save_setting("profile", profile)
+            self._sync_power_mode()
         self._set_status(f"Profile → {profile}" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
 
@@ -683,6 +822,7 @@ class MainWindow(QWidget):
             return
         self._gpu_pending = mode
         _save_setting("gpu", mode)
+        self._sync_power_mode()
         if self._gpu_auto_restart.isChecked():
             self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
             QTimer.singleShot(1500, lambda: _run(
@@ -706,6 +846,32 @@ class MainWindow(QWidget):
         if ok:
             _save_setting("fan_preset", preset)
         self._set_status(f"Fan curve → {preset}" if ok else f"Fan curve error: {msg[:60]}",
+                         "#0ea5e9" if ok else "#ef4444")
+
+    _EPP_MAP = {"LowPower": "power", "Balanced": "balance_power", "Performance": "balance_performance"}
+
+    def _do_power_mode(self, mode: str):
+        """Apply full low-level power tweaks for 'battery' or 'ac' mode."""
+        # Pass the currently selected EPP into the helper so it's applied atomically
+        epp_label = next(
+            (k for k, btn in self._epp.buttons.items() if btn.isChecked()), None
+        )
+        epp_pref = self._EPP_MAP.get(epp_label, "") if epp_label else ""
+        self._set_status(f"Applying {mode} power tweaks…", "#f59e0b")
+        ok, msg = Backend.apply_power_mode(mode, epp_pref)
+        label = "Battery" if mode == "battery" else "AC"
+        self._set_status(
+            f"Power tweaks → {label}  (boost·freq·ASPM·PCI-PM·GPU-DPM·WiFi·USB·audio·NMI)"
+            if ok else f"Power tweak error: {msg[:60]}",
+            "#0ea5e9" if ok else "#ef4444"
+        )
+
+    def _do_epp(self, label):
+        pref = self._EPP_MAP.get(label, "balance_power")
+        ok, msg = Backend.set_epp(pref)
+        if ok:
+            _save_setting("epp", label)
+        self._set_status(f"EPP → {label}" if ok else f"EPP error: {msg[:60]}",
                          "#0ea5e9" if ok else "#ef4444")
 
     def _do_refresh(self, hz):
@@ -740,34 +906,50 @@ class MainWindow(QWidget):
         now_on_ac   = current_on_ac is True
 
         if was_on_ac and now_battery:
-            # Battery: LowPower profile + Integrated GPU + Silent fan + 60 Hz
+            # Battery: LowPower + Integrated GPU + all power tweaks + Silent fan + 60 Hz + kbd/slash off
             Backend.set_profile("LowPower")
             self._profile.set_active("LowPower")
             Backend.set_fan_preset("Silent")
             self._fan.set_active("Silent")
             self._do_refresh(60)
             self._refresh_rate.set_active("60 Hz")
+            self._epp.set_active("LowPower")
+            # Apply full battery power tweaks (EPP + boost off + ASPM + PCI-PM + NMI + writeback)
+            self._do_power_mode("battery")
+            self._power_mode.set_active("Battery")
+            # Keyboard backlight off, slash LED off
+            Backend.set_kbd_brightness("Off")
+            self._kbd.set_active("Off")
+            Backend.set_slash(False)
+            self._slash_off_btn.setChecked(True)
             cur_gpu = Backend.get_gpu_mode()
             if cur_gpu != "Integrated":
-                self._set_status("Unplugged → LowPower · switching GPU to Integrated…", "#f59e0b")
+                self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
                 self._do_gpu("Integrated")
             else:
-                self._set_status("Unplugged → LowPower · Integrated · Silent · 60 Hz", "#f59e0b")
+                self._set_status("Unplugged → full battery mode active", "#f59e0b")
 
         elif was_battery and now_on_ac:
-            # AC: Balanced profile + Hybrid GPU + Balanced fan + Native refresh
+            # AC: Balanced + Hybrid GPU + AC power tweaks + Balanced fan + Native
             Backend.set_profile("Balanced")
             self._profile.set_active("Balanced")
             Backend.set_fan_preset("Balanced")
             self._fan.set_active("Balanced")
             self._do_refresh(None)  # Native
             self._refresh_rate.set_active("Native")
+            self._epp.set_active("Balanced")
+            # Apply AC power tweaks (EPP + boost on + ASPM default + NMI + writeback)
+            self._do_power_mode("ac")
+            self._power_mode.set_active("AC")
+            # Keyboard backlight restore to Low
+            Backend.set_kbd_brightness("Low")
+            self._kbd.set_active("Low")
             cur_gpu = Backend.get_gpu_mode()
             if cur_gpu != "Hybrid":
-                self._set_status("Plugged in → Balanced · switching GPU to Hybrid…", "#0ea5e9")
+                self._set_status("Plugged in → AC mode · switching GPU to Hybrid…", "#0ea5e9")
                 self._do_gpu("Hybrid")
             else:
-                self._set_status("Plugged in → Balanced · Hybrid · Balanced · Native", "#0ea5e9")
+                self._set_status("Plugged in → AC mode active", "#0ea5e9")
 
     # ---------------------------------------------------------------- restore saved settings
 
@@ -889,6 +1071,25 @@ class MainWindow(QWidget):
                 self._refresh_rate.set_active("60 Hz")
             else:
                 self._refresh_rate.set_active("Native")
+
+        # EPP: map raw kernel value back to button label
+        epp_raw = s.get("epp")
+        _raw_to_label = {v: k for k, v in self._EPP_MAP.items()}
+        if epp_raw and epp_raw in _raw_to_label:
+            self._epp.set_active(_raw_to_label[epp_raw])
+
+        # CPU boost indicator
+        boost = s.get("cpu_boost")
+        if boost is not None:
+            boost_txt = "ON" if boost else "OFF"
+            boost_color = "#ef4444" if boost else "#22c55e"
+            self._boost_label.setText(f"CPU Boost: {boost_txt}")
+            self._boost_label.setStyleSheet(f"color: {boost_color}; font-size: 10px;")
+            # Reflect in power mode button
+            if not boost:
+                self._power_mode.set_active("Battery")
+            else:
+                self._power_mode.set_active("AC")
 
         self._hdr_status.setText(f"{profile}  ·  {cap}%")
 

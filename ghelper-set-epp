@@ -1,0 +1,17 @@
+#!/bin/bash
+# Helper script run via pkexec to set CPU Energy Performance Preference.
+# Install: sudo cp ghelper-set-epp /usr/local/bin/ && sudo chmod +x /usr/local/bin/ghelper-set-epp
+# Then drop the polkit action: sudo cp dev.ghelper.setEpp.policy /usr/share/polkit-1/actions/
+
+PREF="$1"
+VALID="default performance balance_performance balance_power power"
+
+# Validate input
+if [[ -z "$PREF" ]] || ! echo "$VALID" | grep -qw "$PREF"; then
+    echo "Usage: ghelper-set-epp <default|performance|balance_performance|balance_power|power>" >&2
+    exit 1
+fi
+
+for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+    echo "$PREF" > "$f"
+done

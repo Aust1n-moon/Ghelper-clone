@@ -1,0 +1,189 @@
+#!/bin/bash
+# ghelper-power — privileged power management helper for G-Helper
+# Usage:
+#   ghelper-power battery [epp]   Apply full battery optimizations
+#   ghelper-power ac      [epp]   Restore AC settings
+#   ghelper-power epp <pref>      Set EPP only
+#
+# Install:
+#   sudo cp ghelper-power /usr/local/bin/ghelper-power
+#   sudo chmod +x /usr/local/bin/ghelper-power
+#   sudo cp dev.ghelper.power.policy /usr/share/polkit-1/actions/
+
+MODE="$1"
+EPP_ARG="$2"
+
+set_epp() {
+    local pref="$1"
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        echo "$pref" > "$f" 2>/dev/null
+    done
+}
+
+set_pci_runtime_pm() {
+    local ctrl="$1"  # "auto" or "on"
+    for f in /sys/bus/pci/devices/*/power/control; do
+        echo "$ctrl" > "$f" 2>/dev/null
+    done
+}
+
+set_cpu_max_freq() {
+    local freq_khz="$1"  # e.g. 1800000 for 1.8 GHz
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+        echo "$freq_khz" > "$f" 2>/dev/null
+    done
+}
+
+reset_cpu_max_freq() {
+    # Restore max freq to hardware limit
+    for cpu_dir in /sys/devices/system/cpu/cpu*/cpufreq; do
+        local hw_max
+        hw_max=$(cat "$cpu_dir/cpuinfo_max_freq" 2>/dev/null)
+        if [[ -n "$hw_max" ]]; then
+            echo "$hw_max" > "$cpu_dir/scaling_max_freq" 2>/dev/null
+        fi
+    done
+}
+
+set_usb_autosuspend() {
+    local val="$1"  # autosuspend delay in seconds (-1 = disabled, 1 = 1s)
+    for f in /sys/bus/usb/devices/*/power/autosuspend_delay_ms; do
+        echo $(( val * 1000 )) > "$f" 2>/dev/null
+    done
+    for f in /sys/bus/usb/devices/*/power/control; do
+        if [[ "$val" -ge 0 ]]; then
+            echo "auto" > "$f" 2>/dev/null
+        else
+            echo "on" > "$f" 2>/dev/null
+        fi
+    done
+}
+
+set_sata_link_pm() {
+    local policy="$1"  # "min_power" or "max_performance"
+    for f in /sys/class/scsi_host/host*/link_power_management_policy; do
+        echo "$policy" > "$f" 2>/dev/null
+    done
+}
+
+case "$MODE" in
+battery)
+    EPP="${EPP_ARG:-power}"
+    set_epp "$EPP"
+
+    # CPU boost off — prevents the 8945HS from spiking to 5+ GHz on light tasks
+    echo 0 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
+
+    # Cap CPU max frequency to 1.8 GHz — video decode is GPU-accelerated,
+    # CPU only needs to handle browser/compositor overhead
+    set_cpu_max_freq 1800000
+
+    # PCIe ASPM — powersupersave enables L1.1/L1.2 substates on all links
+    echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
+
+    # PCI runtime power management — let all devices gate themselves when idle
+    set_pci_runtime_pm auto
+
+    # NMI watchdog — periodic NMI causes unnecessary wakeups
+    echo 0 > /proc/sys/kernel/nmi_watchdog 2>/dev/null
+
+    # Writeback timer — flush dirty pages less frequently (60 s instead of 10 s)
+    echo 6000 > /proc/sys/vm/dirty_writeback_centisecs 2>/dev/null
+
+    # Timer migration — disable migrating timers across cores (reduces wakeups)
+    echo 0 > /proc/sys/kernel/timer_migration 2>/dev/null
+
+    # AMDGPU — force lowest DPM state (sufficient for HW video decode)
+    for card in /sys/class/drm/card*/device; do
+        if [[ -f "$card/power_dpm_force_performance_level" ]]; then
+            echo "low" > "$card/power_dpm_force_performance_level" 2>/dev/null
+        fi
+    done
+
+    # WiFi power saving — reduces radio power between beacons (~0.5-1W saving)
+    iw dev wlp3s0 set power_save on 2>/dev/null
+    # Fallback: try all wireless interfaces
+    for iface in /sys/class/net/wl*; do
+        iface_name=$(basename "$iface")
+        iw dev "$iface_name" set power_save on 2>/dev/null
+    done
+
+    # Audio codec power saving — put HDA codec to sleep after 1 second of silence
+    echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
+
+    # USB autosuspend — allow USB devices to sleep after 1 second idle
+    set_usb_autosuspend 1
+
+    # SATA/AHCI link power management — minimum power on battery
+    set_sata_link_pm min_power
+
+    # VM — reduce swappiness and compact memory less aggressively
+    echo 10 > /proc/sys/vm/swappiness 2>/dev/null
+    echo 1500 > /proc/sys/vm/dirty_expire_centisecs 2>/dev/null
+    ;;
+
+ac)
+    EPP="${EPP_ARG:-balance_power}"
+    set_epp "$EPP"
+
+    # CPU boost on
+    echo 1 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
+
+    # Restore CPU max frequency to hardware limit
+    reset_cpu_max_freq
+
+    # PCIe ASPM — back to default
+    echo default > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
+
+    # NMI watchdog — re-enable
+    echo 1 > /proc/sys/kernel/nmi_watchdog 2>/dev/null
+
+    # Writeback timer — normal (15 s)
+    echo 1500 > /proc/sys/vm/dirty_writeback_centisecs 2>/dev/null
+
+    # Timer migration — re-enable
+    echo 1 > /proc/sys/kernel/timer_migration 2>/dev/null
+
+    # AMDGPU — back to auto DPM
+    for card in /sys/class/drm/card*/device; do
+        if [[ -f "$card/power_dpm_force_performance_level" ]]; then
+            echo "auto" > "$card/power_dpm_force_performance_level" 2>/dev/null
+        fi
+    done
+
+    # WiFi power saving — off on AC for lower latency
+    for iface in /sys/class/net/wl*; do
+        iface_name=$(basename "$iface")
+        iw dev "$iface_name" set power_save off 2>/dev/null
+    done
+
+    # Audio codec — 10s power save (balanced on AC)
+    echo 10 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
+
+    # USB autosuspend — keep enabled but with longer delay
+    set_usb_autosuspend 2
+
+    # SATA/AHCI link power management — balanced on AC
+    set_sata_link_pm med_power_with_dipm
+
+    # VM — restore defaults
+    echo 60 > /proc/sys/vm/swappiness 2>/dev/null
+    echo 3000 > /proc/sys/vm/dirty_expire_centisecs 2>/dev/null
+
+    # PCI runtime PM — leave as-is (auto is fine on AC too)
+    ;;
+
+epp)
+    VALID="default performance balance_performance balance_power power"
+    if [[ -z "$EPP_ARG" ]] || ! echo "$VALID" | grep -qw "$EPP_ARG"; then
+        echo "Usage: ghelper-power epp <default|performance|balance_performance|balance_power|power>" >&2
+        exit 1
+    fi
+    set_epp "$EPP_ARG"
+    ;;
+
+*)
+    echo "Usage: ghelper-power battery|ac|epp [pref]" >&2
+    exit 1
+    ;;
+esac
