@@ -214,8 +214,14 @@ class Backend:
 
     @staticmethod
     def set_epp(pref: str):
-        out, err, rc = _run(f"pkexec /usr/local/bin/ghelper-power epp {pref}", timeout=15)
-        return rc == 0, err or out
+        import glob as _glob
+        try:
+            for f in _glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"):
+                with open(f, "w") as fh:
+                    fh.write(pref)
+            return True, ""
+        except Exception as e:
+            return False, str(e)[:80]
 
     @staticmethod
     def get_epp():
@@ -223,15 +229,9 @@ class Backend:
         return val or "unknown"
 
     @staticmethod
-    def apply_power_mode(mode: str, epp: str = ""):
-        """Apply full battery or AC power profile via polkit helper.
-        mode: 'battery' or 'ac'
-        epp: optional EPP override (e.g. 'power', 'balance_power')
-        """
-        cmd = f"pkexec /usr/local/bin/ghelper-power {mode}"
-        if epp:
-            cmd += f" {epp}"
-        out, err, rc = _run(cmd, timeout=20)
+    def apply_power_mode(mode: str):
+        """Apply full battery or AC power profile via polkit helper."""
+        out, err, rc = _run(f"sudo /usr/local/bin/ghelper-power {mode}", timeout=20)
         return rc == 0, err or out
 
     @staticmethod
@@ -405,8 +405,8 @@ class StatusWorker(QThread):
             "gpu":       Backend.get_gpu_mode(),
             "temps":     Backend.get_temps(),
             "display":   Backend.get_display_info(),
-            "epp":       Backend.get_epp(),
             "cpu_boost": Backend.get_cpu_boost(),
+            "epp":       Backend.get_epp(),
         })
 
 
@@ -627,14 +627,10 @@ class MainWindow(QWidget):
         gl = QVBoxLayout(g)
         self._profile = _ButtonRow(["LowPower", "Balanced", "Performance"])
         gl.addWidget(self._profile)
-        epp_row = QHBoxLayout()
-        epp_lbl = QLabel("EPP:")
-        epp_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
-        self._epp = _ButtonRow(["LowPower", "Balanced", "Performance"])
-        epp_row.addWidget(epp_lbl)
-        epp_row.addWidget(self._epp)
-        gl.addLayout(epp_row)
-        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · EPP · fan · display · kbd · slash)")
+        self._epp_label = QLabel("EPP: –")
+        self._epp_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        gl.addWidget(self._epp_label)
+        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display · kbd · slash)")
         self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
         gl.addWidget(self._auto_switch)
         root.addWidget(g)
@@ -754,8 +750,6 @@ class MainWindow(QWidget):
         self._refresh_rate.buttons["60 Hz"].clicked.connect(lambda: self._do_refresh(60))
         self._refresh_rate.buttons["Native"].clicked.connect(lambda: self._do_refresh(None))
 
-        for name, btn in self._epp.buttons.items():
-            btn.clicked.connect(lambda _, n=name: self._do_epp(n))
 
         self._power_mode.buttons["Battery"].clicked.connect(lambda: self._do_power_mode("battery"))
         self._power_mode.buttons["AC"].clicked.connect(lambda: self._do_power_mode("ac"))
@@ -848,31 +842,16 @@ class MainWindow(QWidget):
         self._set_status(f"Fan curve → {preset}" if ok else f"Fan curve error: {msg[:60]}",
                          "#0ea5e9" if ok else "#ef4444")
 
-    _EPP_MAP = {"LowPower": "power", "Balanced": "balance_power", "Performance": "balance_performance"}
-
     def _do_power_mode(self, mode: str):
         """Apply full low-level power tweaks for 'battery' or 'ac' mode."""
-        # Pass the currently selected EPP into the helper so it's applied atomically
-        epp_label = next(
-            (k for k, btn in self._epp.buttons.items() if btn.isChecked()), None
-        )
-        epp_pref = self._EPP_MAP.get(epp_label, "") if epp_label else ""
         self._set_status(f"Applying {mode} power tweaks…", "#f59e0b")
-        ok, msg = Backend.apply_power_mode(mode, epp_pref)
+        ok, msg = Backend.apply_power_mode(mode)
         label = "Battery" if mode == "battery" else "AC"
         self._set_status(
             f"Power tweaks → {label}  (boost·freq·ASPM·PCI-PM·GPU-DPM·WiFi·USB·audio·NMI)"
             if ok else f"Power tweak error: {msg[:60]}",
             "#0ea5e9" if ok else "#ef4444"
         )
-
-    def _do_epp(self, label):
-        pref = self._EPP_MAP.get(label, "balance_power")
-        ok, msg = Backend.set_epp(pref)
-        if ok:
-            _save_setting("epp", label)
-        self._set_status(f"EPP → {label}" if ok else f"EPP error: {msg[:60]}",
-                         "#0ea5e9" if ok else "#ef4444")
 
     def _do_refresh(self, hz):
         if hz is None:
@@ -913,7 +892,6 @@ class MainWindow(QWidget):
             self._fan.set_active("Silent")
             self._do_refresh(60)
             self._refresh_rate.set_active("60 Hz")
-            self._epp.set_active("LowPower")
             # Apply full battery power tweaks (EPP + boost off + ASPM + PCI-PM + NMI + writeback)
             self._do_power_mode("battery")
             self._power_mode.set_active("Battery")
@@ -937,7 +915,6 @@ class MainWindow(QWidget):
             self._fan.set_active("Balanced")
             self._do_refresh(None)  # Native
             self._refresh_rate.set_active("Native")
-            self._epp.set_active("Balanced")
             # Apply AC power tweaks (EPP + boost on + ASPM default + NMI + writeback)
             self._do_power_mode("ac")
             self._power_mode.set_active("AC")
@@ -959,8 +936,7 @@ class MainWindow(QWidget):
         profile = s.get("profile")
         if profile and profile in self._profile.buttons:
             self._profile.set_active(profile)
-            import threading
-            threading.Thread(target=Backend.set_profile, args=(profile,), daemon=True).start()
+            Backend.set_profile(profile)
 
         fan = s.get("fan_preset")
         if fan and fan in self._fan.buttons:
@@ -1072,11 +1048,11 @@ class MainWindow(QWidget):
             else:
                 self._refresh_rate.set_active("Native")
 
-        # EPP: map raw kernel value back to button label
+
+        # EPP (read-only, managed by auto-cpufreq)
         epp_raw = s.get("epp")
-        _raw_to_label = {v: k for k, v in self._EPP_MAP.items()}
-        if epp_raw and epp_raw in _raw_to_label:
-            self._epp.set_active(_raw_to_label[epp_raw])
+        if epp_raw:
+            self._epp_label.setText(f"EPP: {epp_raw}")
 
         # CPU boost indicator
         boost = s.get("cpu_boost")

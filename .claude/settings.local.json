@@ -68,7 +68,17 @@
       "Bash(gh api:*)",
       "Bash(grep -E '\\\\.py$')",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(sudo /usr/local/bin/ghelper-power ac power)",
+      "Bash(pkexec /usr/local/bin/ghelper-power epp power)",
+      "Bash(pkexec bash:*)",
+      "Bash(pkexec /usr/local/bin/ghelper-power epp balance_power)",
+      "Bash(cat /sys/bus/platform/drivers/asus-nb-wmi/*/dgpu_disable)",
+      "Bash(sudo tee:*)",
+      "Bash(sudo -n /usr/local/bin/ghelper-power epp power)",
+      "Bash(sudo -n /usr/local/bin/ghelper-power epp balance_power)",
+      "Bash(pgrep -af python3.*ghelper.py)",
+      "Bash(pkexec cp:*)"
     ]
   }
 }

@@ -68,8 +68,7 @@ set_sata_link_pm() {
 
 case "$MODE" in
 battery)
-    EPP="${EPP_ARG:-power}"
-    set_epp "$EPP"
+    # EPP is handled directly by the app via sysfs
 
     # CPU boost off — prevents the 8945HS from spiking to 5+ GHz on light tasks
     echo 0 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
@@ -123,8 +122,7 @@ battery)
     ;;
 
 ac)
-    EPP="${EPP_ARG:-balance_power}"
-    set_epp "$EPP"
+    # EPP is handled directly by the app via sysfs
 
     # CPU boost on
     echo 1 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
