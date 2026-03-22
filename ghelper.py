@@ -631,7 +631,9 @@ class MainWindow(QWidget):
         self._epp_label.setStyleSheet("color: #64748b; font-size: 11px;")
         gl.addWidget(self._epp_label)
         self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display · kbd · slash)")
+        self._auto_switch.setChecked(_load_settings().get("auto_switch", True))
         self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self._auto_switch.toggled.connect(lambda v: _save_setting("auto_switch", v))
         gl.addWidget(self._auto_switch)
         root.addWidget(g)
 
@@ -876,8 +878,16 @@ class MainWindow(QWidget):
 
         prev = self._last_ac_status
         self._last_ac_status = current_on_ac
-        if not self._auto_switch.isChecked() or prev is None:
+        if not self._auto_switch.isChecked():
             return
+
+        # On first refresh (launch), treat as a transition so the correct
+        # power mode is applied immediately for the current AC state.
+        if prev is None:
+            if current_on_ac:
+                prev = False   # pretend was_battery → now_on_ac
+            else:
+                prev = True    # pretend was_on_ac → now_battery
 
         was_on_ac   = prev is True
         now_battery = current_on_ac is False
