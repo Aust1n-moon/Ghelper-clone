@@ -1,0 +1,248 @@
+#!/bin/bash
+# ghelper-sleep — systemd sleep hook to minimize s2idle power draw
+# Install: sudo cp ghelper-sleep /usr/lib/systemd/system-sleep/ghelper-sleep
+#          sudo chmod +x /usr/lib/systemd/system-sleep/ghelper-sleep
+#
+# On s2idle (modern standby), devices stay partially powered unless explicitly
+# shut down. This script disables wakeup sources and powers down peripherals
+# before suspend, then restores the active ghelper profile on resume.
+
+STATE_FILE="/tmp/ghelper-sleep-state"
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+disable_wakeup() {
+    # Disable USB controller wakeup (XHC*) — biggest s2idle power drain
+    for dev in /proc/acpi/wakeup; do
+        while IFS= read -r line; do
+            local name state
+            name=$(echo "$line" | awk '{print $1}')
+            state=$(echo "$line" | awk '{print $3}')
+            case "$name" in
+                XHC*|GPP*|GP1*|NHI*)
+                    if [[ "$state" == "*enabled" ]]; then
+                        echo "$name" > /proc/acpi/wakeup
+                    fi
+                    ;;
+            esac
+        done < "$dev"
+    done
+}
+
+restore_wakeup() {
+    # Re-enable wakeup sources that were disabled
+    if [[ -f "$STATE_FILE.wakeup" ]]; then
+        while IFS= read -r name; do
+            echo "$name" > /proc/acpi/wakeup
+        done < "$STATE_FILE.wakeup"
+        rm -f "$STATE_FILE.wakeup"
+    fi
+}
+
+save_wakeup_state() {
+    # Record which wakeup sources are currently enabled so we can restore them
+    > "$STATE_FILE.wakeup"
+    while IFS= read -r line; do
+        local name state
+        name=$(echo "$line" | awk '{print $1}')
+        state=$(echo "$line" | awk '{print $3}')
+        case "$name" in
+            XHC*|GPP*|GP1*|NHI*)
+                if [[ "$state" == "*enabled" ]]; then
+                    echo "$name" >> "$STATE_FILE.wakeup"
+                fi
+                ;;
+        esac
+    done < /proc/acpi/wakeup
+}
+
+suspend_nvidia() {
+    # Ensure the NVIDIA dGPU is fully powered off for sleep
+    # If runtime PM is available, force it off
+    for card in /sys/bus/pci/devices/*/; do
+        if [[ -f "$card/class" ]]; then
+            local class
+            class=$(cat "$card/class" 2>/dev/null)
+            # 0x030000 = VGA, 0x030200 = 3D controller (NVIDIA mobile)
+            if [[ "$class" == "0x030000" || "$class" == "0x030200" ]]; then
+                local vendor
+                vendor=$(cat "$card/vendor" 2>/dev/null)
+                if [[ "$vendor" == "0x10de" ]]; then
+                    # NVIDIA GPU — enable runtime PM and force suspend
+                    echo "auto" > "$card/power/control" 2>/dev/null
+                fi
+            fi
+        fi
+    done
+}
+
+suspend_wifi() {
+    # Unbind the WiFi adapter to fully power it down during sleep
+    # MediaTek MT7922 is known to draw significant power in s2idle
+    local wifi_pci
+    for dev in /sys/bus/pci/devices/*/; do
+        if [[ -f "$dev/class" ]]; then
+            local class
+            class=$(cat "$dev/class" 2>/dev/null)
+            # 0x028000 = Network controller (wireless)
+            if [[ "$class" == "0x028000" ]]; then
+                wifi_pci=$(basename "$dev")
+                echo "$wifi_pci" > "$STATE_FILE.wifi"
+                # Save the driver binding
+                local driver
+                driver=$(basename "$(readlink "$dev/driver")" 2>/dev/null)
+                echo "$driver" >> "$STATE_FILE.wifi"
+                # Unbind
+                if [[ -n "$driver" && -f "/sys/bus/pci/drivers/$driver/unbind" ]]; then
+                    echo "$wifi_pci" > "/sys/bus/pci/drivers/$driver/unbind" 2>/dev/null
+                fi
+                break
+            fi
+        fi
+    done
+}
+
+resume_wifi() {
+    if [[ -f "$STATE_FILE.wifi" ]]; then
+        local wifi_pci driver
+        wifi_pci=$(sed -n '1p' "$STATE_FILE.wifi")
+        driver=$(sed -n '2p' "$STATE_FILE.wifi")
+        if [[ -n "$wifi_pci" && -n "$driver" && -f "/sys/bus/pci/drivers/$driver/bind" ]]; then
+            echo "$wifi_pci" > "/sys/bus/pci/drivers/$driver/bind" 2>/dev/null
+        fi
+        rm -f "$STATE_FILE.wifi"
+    fi
+}
+
+freeze_usb() {
+    # Force all USB devices into suspend before sleep
+    for f in /sys/bus/usb/devices/*/power/control; do
+        echo "auto" > "$f" 2>/dev/null
+    done
+    # Set aggressive autosuspend (immediate)
+    for f in /sys/bus/usb/devices/*/power/autosuspend_delay_ms; do
+        echo "0" > "$f" 2>/dev/null
+    done
+}
+
+power_down_nvme() {
+    # Set NVMe power state to deepest available
+    if command -v nvme &>/dev/null; then
+        for dev in /dev/nvme[0-9]; do
+            nvme set-feature "$dev" -f 2 -v 2 2>/dev/null
+        done
+    fi
+}
+
+power_up_nvme() {
+    # Restore NVMe to default power state
+    if command -v nvme &>/dev/null; then
+        for dev in /dev/nvme[0-9]; do
+            nvme set-feature "$dev" -f 2 -v 0 2>/dev/null
+        done
+    fi
+}
+
+save_current_profile() {
+    # Save which ghelper power mode is active so we can restore it on resume
+    # Check if on AC or battery
+    for ps_path in /sys/class/power_supply/*; do
+        local ps_type
+        ps_type=$(cat "$ps_path/type" 2>/dev/null)
+        if [[ "$ps_type" == "Mains" ]]; then
+            local online
+            online=$(cat "$ps_path/online" 2>/dev/null)
+            if [[ "$online" == "1" ]]; then
+                echo "ac" > "$STATE_FILE"
+            else
+                echo "battery" > "$STATE_FILE"
+            fi
+            return
+        fi
+    done
+    echo "battery" > "$STATE_FILE"
+}
+
+restore_profile() {
+    # Re-apply the ghelper power profile that was active before sleep
+    if [[ -f "$STATE_FILE" ]]; then
+        local mode
+        mode=$(cat "$STATE_FILE")
+        /usr/local/bin/ghelper-power "$mode" 2>/dev/null
+        rm -f "$STATE_FILE"
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+case "$1" in
+    pre)
+        # Before suspend: aggressively power down everything
+        save_current_profile
+        save_wakeup_state
+
+        # Disable wakeup sources that cause spurious wakes and power drain
+        disable_wakeup
+
+        # Power down WiFi (MediaTek MT7922 draws ~2-3W in s2idle otherwise)
+        suspend_wifi
+
+        # Ensure NVIDIA dGPU is powered off
+        suspend_nvidia
+
+        # Force USB devices to suspend
+        freeze_usb
+
+        # NVMe to deepest power state
+        power_down_nvme
+
+        # Audio codec — immediate power save
+        echo 0 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
+
+        # PCIe ASPM — deepest possible
+        echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
+
+        # All PCI devices to auto PM
+        for f in /sys/bus/pci/devices/*/power/control; do
+            echo "auto" > "$f" 2>/dev/null
+        done
+
+        # CPU — disable boost and set lowest EPP
+        echo 0 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+            echo "power" > "$f" 2>/dev/null
+        done
+
+        # AMDGPU iGPU — force lowest power state
+        for card in /sys/class/drm/card*/device; do
+            if [[ -f "$card/power_dpm_force_performance_level" ]]; then
+                echo "low" > "$card/power_dpm_force_performance_level" 2>/dev/null
+            fi
+        done
+
+        # Disable NMI watchdog
+        echo 0 > /proc/sys/kernel/nmi_watchdog 2>/dev/null
+
+        # Disable timer migration
+        echo 0 > /proc/sys/kernel/timer_migration 2>/dev/null
+        ;;
+
+    post)
+        # After resume: restore WiFi, wakeup sources, and the active profile
+
+        # Restore WiFi first (user expects connectivity)
+        resume_wifi
+
+        # Restore wakeup sources
+        restore_wakeup
+
+        # NVMe back to normal
+        power_up_nvme
+
+        # Re-apply the ghelper power profile (battery or ac)
+        # This restores EPP, boost, ASPM, GPU DPM, fan curves, etc.
+        restore_profile
+        ;;
+esac
+
+exit 0

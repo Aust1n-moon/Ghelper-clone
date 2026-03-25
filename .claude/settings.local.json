@@ -78,7 +78,10 @@
       "Bash(sudo -n /usr/local/bin/ghelper-power epp power)",
       "Bash(sudo -n /usr/local/bin/ghelper-power epp balance_power)",
       "Bash(pgrep -af python3.*ghelper.py)",
-      "Bash(pkexec cp:*)"
+      "Bash(pkexec cp:*)",
+      "Read(//sys/power/**)",
+      "Read(//usr/lib/systemd/system-sleep/**)",
+      "Bash(dmesg)"
     ]
   }
 }
