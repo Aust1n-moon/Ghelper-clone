@@ -184,33 +184,6 @@ class Backend:
         out, err, rc = _run(f"asusctl battery limit {limit}")
         return rc == 0, err or out
 
-    @staticmethod
-    def get_brightness():
-        if not _DBUS_OK:
-            return None
-        try:
-            bus = _dbus.SessionBus()
-            proxy = bus.get_object("org.gnome.SettingsDaemon.Power",
-                                   "/org/gnome/SettingsDaemon/Power")
-            iface = _dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
-            return int(iface.Get("org.gnome.SettingsDaemon.Power.Screen", "Brightness"))
-        except Exception:
-            return None
-
-    @staticmethod
-    def set_brightness(pct: int):
-        if not _DBUS_OK:
-            return False, "python3-dbus unavailable"
-        try:
-            bus = _dbus.SessionBus()
-            proxy = bus.get_object("org.gnome.SettingsDaemon.Power",
-                                   "/org/gnome/SettingsDaemon/Power")
-            iface = _dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
-            iface.Set("org.gnome.SettingsDaemon.Power.Screen", "Brightness",
-                      _dbus.Int32(max(1, min(100, pct))))
-            return True, ""
-        except Exception as e:
-            return False, str(e)[:80]
 
     @staticmethod
     def set_epp(pref: str):
