@@ -81,19 +81,31 @@ FAN_PRESETS = {
 }
 
 
+# asusctl uses "Quiet" but the app displays "LowPower"
+_PROFILE_TO_ASUSCTL = {"LowPower": "Quiet", "Balanced": "Balanced", "Performance": "Performance"}
+_ASUSCTL_TO_PROFILE = {v.lower(): k for k, v in _PROFILE_TO_ASUSCTL.items()}
+
+
 class Backend:
     @staticmethod
     def get_profile():
         out, _, rc = _run("asusctl profile get")
         if rc == 0:
-            for p in ("LowPower", "Balanced", "Performance"):
-                if p.lower() in out.lower():
-                    return p
+            # Only parse the "Active profile:" line — the full output also
+            # lists AC/Battery defaults which caused false substring matches.
+            for line in out.splitlines():
+                low = line.lower()
+                if "active" not in low:
+                    continue
+                for asusctl_name, app_name in _ASUSCTL_TO_PROFILE.items():
+                    if asusctl_name in low:
+                        return app_name
         return "Unknown"
 
     @staticmethod
     def set_profile(profile):
-        out, err, rc = _run(f"asusctl profile set {profile}")
+        asusctl_name = _PROFILE_TO_ASUSCTL.get(profile, profile)
+        out, err, rc = _run(f"asusctl profile set {asusctl_name}")
         return rc == 0, err or out
 
     @staticmethod
@@ -522,6 +534,7 @@ class MainWindow(QWidget):
         )
         self._last_ac_status = None
         self._native_rate = None
+        self._intended_profile = None   # profile ghelper actively defends
         self._build_ui()
         self._connect()
         self._worker = None
@@ -755,6 +768,7 @@ class MainWindow(QWidget):
     def _do_profile(self, profile):
         ok, msg = Backend.set_profile(profile)
         if ok:
+            self._intended_profile = profile
             _save_setting("profile", profile)
             self._sync_power_mode()
         self._set_status(f"Profile → {profile}" if ok else f"Error: {msg[:70]}",
@@ -870,6 +884,8 @@ class MainWindow(QWidget):
         if was_on_ac and now_battery:
             # Battery: LowPower + Integrated GPU + all power tweaks + Silent fan + 60 Hz + kbd/slash off
             Backend.set_profile("LowPower")
+            self._intended_profile = "LowPower"
+            _save_setting("profile", "LowPower")
             self._profile.set_active("LowPower")
             Backend.set_fan_preset("Silent")
             self._fan.set_active("Silent")
@@ -893,6 +909,8 @@ class MainWindow(QWidget):
         elif was_battery and now_on_ac:
             # AC: Balanced + Hybrid GPU + AC power tweaks + Balanced fan + Native
             Backend.set_profile("Balanced")
+            self._intended_profile = "Balanced"
+            _save_setting("profile", "Balanced")
             self._profile.set_active("Balanced")
             Backend.set_fan_preset("Balanced")
             self._fan.set_active("Balanced")
@@ -918,8 +936,15 @@ class MainWindow(QWidget):
 
         profile = s.get("profile")
         if profile and profile in self._profile.buttons:
+            self._intended_profile = profile
             self._profile.set_active(profile)
-            Backend.set_profile(profile)
+            # If auto-switch is enabled, skip applying the saved profile now —
+            # the first refresh will apply the correct one for the current
+            # AC/battery state.  This prevents a stale "Performance" saved
+            # from a previous AC session from briefly overriding LowPower
+            # on battery.
+            if not self._auto_switch.isChecked():
+                Backend.set_profile(profile)
 
         fan = s.get("fan_preset")
         if fan and fan in self._fan.buttons:
@@ -973,6 +998,15 @@ class MainWindow(QWidget):
         bat     = s.get("battery", {})
         temps   = s.get("temps", {})
         display = s.get("display")
+
+        # If ghelper has an intended profile and the system drifted (e.g.
+        # power-profiles-daemon or asusd reverted it), re-apply our choice
+        # instead of silently accepting the external change.
+        if (self._intended_profile
+                and profile != self._intended_profile
+                and profile != "Unknown"):
+            Backend.set_profile(self._intended_profile)
+            profile = self._intended_profile
 
         self._profile.set_active(profile)
         self._kbd.set_active(kbd)

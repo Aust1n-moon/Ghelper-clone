@@ -83,7 +83,10 @@
       "Read(//usr/lib/systemd/system-sleep/**)",
       "Bash(dmesg)",
       "Bash(find \"/home/atm/Documents/Projects/Ghelper clone\" -type f \\\\\\( -name \"*.py\" -o -name \"ghelper-*\" \\\\\\) -not -path '*/\\\\.git/*' -not -path '*/__pycache__/*' -exec wc -l {} +)",
-      "Bash(sudo grubby:*)"
+      "Bash(sudo grubby:*)",
+      "Bash(cat /sys/class/power_supply/*/type)",
+      "Bash(cat /sys/class/power_supply/*/online)",
+      "Bash(cat /sys/class/power_supply/BAT*/status)"
     ]
   }
 }
