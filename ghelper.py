@@ -226,18 +226,27 @@ class Backend:
             return None
         return val == "1"
 
+    _GPU_TO_SUPERGFX = {"Dedicated": "AsusMuxDgpu"}
+    _SUPERGFX_TO_GPU = {"asusmuxdgpu": "Dedicated"}
+
     @staticmethod
     def get_gpu_mode():
         out, _, rc = _run("supergfxctl -g")
         if rc == 0:
-            for m in ("Integrated", "Hybrid", "Dedicated", "Vfio"):
-                if m.lower() in out.lower():
+            lower = out.strip().lower()
+            if lower in Backend._SUPERGFX_TO_GPU:
+                return Backend._SUPERGFX_TO_GPU[lower]
+            for m in ("Integrated", "Hybrid"):
+                if m.lower() in lower:
                     return m
         return "Unknown"
 
     @staticmethod
     def set_gpu_mode(mode):
-        out, err, rc = _run(f"supergfxctl -m {mode}", timeout=60)
+        sgfx_mode = Backend._GPU_TO_SUPERGFX.get(mode, mode)
+        # MUX switches (AsusMuxDgpu) take significantly longer than hybrid/integrated
+        timeout = 180 if sgfx_mode == "AsusMuxDgpu" else 60
+        out, err, rc = _run(f"supergfxctl -m {sgfx_mode}", timeout=timeout)
         return rc == 0, err or out
 
     @staticmethod
@@ -806,17 +815,24 @@ class MainWindow(QWidget):
         self._gpu_pending = mode
         _save_setting("gpu", mode)
         self._sync_power_mode()
+        cur_gpu = Backend.get_gpu_mode()
+        needs_reboot = mode == "Dedicated" or cur_gpu == "Dedicated"
         if self._gpu_auto_restart.isChecked():
-            self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
-            QTimer.singleShot(1500, lambda: _run(
-                "dbus-send --session --type=method_call "
-                "--dest=org.gnome.SessionManager "
-                "/org/gnome/SessionManager "
-                "org.gnome.SessionManager.Logout uint32:1",
-                timeout=10
-            ))
+            if needs_reboot:
+                self._set_status(f"GPU → {mode}  Rebooting (MUX switch)…", "#0ea5e9")
+                QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
+            else:
+                self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
+                QTimer.singleShot(1500, lambda: _run(
+                    "dbus-send --session --type=method_call "
+                    "--dest=org.gnome.SessionManager "
+                    "/org/gnome/SessionManager "
+                    "org.gnome.SessionManager.Logout uint32:1",
+                    timeout=10
+                ))
         else:
-            self._set_status(f"GPU → {mode} (logout to apply)", "#0ea5e9")
+            action = "reboot" if needs_reboot else "logout"
+            self._set_status(f"GPU → {mode} ({action} to apply)", "#0ea5e9")
 
     def _do_limit(self, limit):
         ok, msg = Backend.set_charge_limit(limit)
@@ -1121,8 +1137,11 @@ class GHelperApp:
         self.win.show()
 
     def _on_quit(self):
-        # Set GPU to Integrated on exit so the next boot starts without the dGPU.
-        Backend.set_gpu_mode("Integrated")
+        # Only reset GPU on exit when auto-switch is managing the GPU mode.
+        # When the user has manually chosen a mode (e.g. Dedicated), respect it
+        # across restarts by leaving the saved setting intact.
+        if self.win._auto_switch.isChecked():
+            Backend.set_gpu_mode("Integrated")
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(_make_icon(), self.app)
