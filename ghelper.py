@@ -275,11 +275,12 @@ class Backend:
         profile = Backend.get_profile()
         if profile == "Unknown":
             return False, "Could not detect current profile"
-        _run(f"asusctl fan-curve --mod-profile {profile} --enable-fan-curves true")
+        asusctl_profile = _PROFILE_TO_ASUSCTL.get(profile, profile)
+        _run(f"asusctl fan-curve --mod-profile {asusctl_profile} --enable-fan-curves true")
         errors = []
         for fan in ("cpu", "gpu", "mid"):
             _, err, rc = _run(
-                f"asusctl fan-curve --mod-profile {profile} --fan {fan} --data '{data}'"
+                f"asusctl fan-curve --mod-profile {asusctl_profile} --fan {fan} --data '{data}'"
             )
             if rc != 0 and "not supported" not in err.lower() and "no fan" not in err.lower():
                 errors.append(f"{fan}: {err[:40]}")
@@ -655,9 +656,6 @@ class MainWindow(QWidget):
         gl = QVBoxLayout(g)
         self._gpu = _ButtonRow(["Integrated", "Hybrid", "Dedicated"])
         gl.addWidget(self._gpu)
-        self._gpu_auto_restart = QCheckBox("Auto restart session after switch")
-        self._gpu_auto_restart.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        gl.addWidget(self._gpu_auto_restart)
         root.addWidget(g)
 
         # Fan Curve
@@ -817,22 +815,18 @@ class MainWindow(QWidget):
         self._sync_power_mode()
         cur_gpu = Backend.get_gpu_mode()
         needs_reboot = mode == "Dedicated" or cur_gpu == "Dedicated"
-        if self._gpu_auto_restart.isChecked():
-            if needs_reboot:
-                self._set_status(f"GPU → {mode}  Rebooting (MUX switch)…", "#0ea5e9")
-                QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
-            else:
-                self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
-                QTimer.singleShot(1500, lambda: _run(
-                    "dbus-send --session --type=method_call "
-                    "--dest=org.gnome.SessionManager "
-                    "/org/gnome/SessionManager "
-                    "org.gnome.SessionManager.Logout uint32:1",
-                    timeout=10
-                ))
+        if needs_reboot:
+            self._set_status(f"GPU → {mode}  Rebooting (MUX switch)…", "#0ea5e9")
+            QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
         else:
-            action = "reboot" if needs_reboot else "logout"
-            self._set_status(f"GPU → {mode} ({action} to apply)", "#0ea5e9")
+            self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
+            QTimer.singleShot(1500, lambda: _run(
+                "dbus-send --session --type=method_call "
+                "--dest=org.gnome.SessionManager "
+                "/org/gnome/SessionManager "
+                "org.gnome.SessionManager.Logout uint32:1",
+                timeout=10
+            ))
 
     def _do_limit(self, limit):
         ok, msg = Backend.set_charge_limit(limit)
@@ -886,7 +880,11 @@ class MainWindow(QWidget):
 
         # On first refresh (launch), treat as a transition so the correct
         # power mode is applied immediately for the current AC state.
-        if prev is None:
+        # But skip GPU switching — _restore_settings() already applied the
+        # saved GPU mode, and overriding it here undoes manual choices that
+        # survived a reboot/logout.
+        first_launch = prev is None
+        if first_launch:
             if current_on_ac:
                 prev = False   # pretend was_battery → now_on_ac
             else:
@@ -915,10 +913,13 @@ class MainWindow(QWidget):
             self._kbd.set_active("Off")
             Backend.set_slash(False)
             self._slash_off_btn.setChecked(True)
-            cur_gpu = Backend.get_gpu_mode()
-            if cur_gpu != "Integrated":
-                self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
-                self._do_gpu("Integrated")
+            if not first_launch:
+                cur_gpu = Backend.get_gpu_mode()
+                if cur_gpu != "Integrated":
+                    self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
+                    self._do_gpu("Integrated")
+                else:
+                    self._set_status("Unplugged → full battery mode active", "#f59e0b")
             else:
                 self._set_status("Unplugged → full battery mode active", "#f59e0b")
 
@@ -938,10 +939,13 @@ class MainWindow(QWidget):
             # Keyboard backlight restore to Low
             Backend.set_kbd_brightness("Low")
             self._kbd.set_active("Low")
-            cur_gpu = Backend.get_gpu_mode()
-            if cur_gpu != "Hybrid":
-                self._set_status("Plugged in → AC mode · switching GPU to Hybrid…", "#0ea5e9")
-                self._do_gpu("Hybrid")
+            if not first_launch:
+                cur_gpu = Backend.get_gpu_mode()
+                if cur_gpu != "Hybrid":
+                    self._set_status("Plugged in → AC mode · switching GPU to Hybrid…", "#0ea5e9")
+                    self._do_gpu("Hybrid")
+                else:
+                    self._set_status("Plugged in → AC mode active", "#0ea5e9")
             else:
                 self._set_status("Plugged in → AC mode active", "#0ea5e9")
 
@@ -1101,6 +1105,19 @@ class MainWindow(QWidget):
                 self._power_mode.set_active("AC")
 
         self._hdr_status.setText(f"{profile}  ·  {cap}%")
+
+        # Check if we just woke from sleep — the systemd sleep hook writes
+        # this file on resume so we know to re-apply the full profile.
+        _wake_signal = Path("/tmp/ghelper-wake-signal")
+        if _wake_signal.exists():
+            try:
+                _wake_signal.unlink()
+            except OSError:
+                pass
+            # Reset AC tracking so _check_ac_auto_switch treats this as a
+            # fresh start and re-applies the full profile (fan, refresh,
+            # EPP, kbd, GPU, etc.) for the current AC/battery state.
+            self._last_ac_status = None
 
         # AC/DC auto profile switch
         self._check_ac_auto_switch(bat.get("status", "Unknown"))

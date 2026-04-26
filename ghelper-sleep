@@ -58,7 +58,9 @@ save_wakeup_state() {
 
 suspend_nvidia() {
     # Ensure the NVIDIA dGPU is fully powered off for sleep
-    # If runtime PM is available, force it off
+    # Just enabling runtime PM ("auto") is not enough — if the GPU has
+    # active clients it stays awake and draws 5-15 W in s2idle.
+    # Unbind the driver to guarantee it powers down.
     for card in /sys/bus/pci/devices/*/; do
         if [[ -f "$card/class" ]]; then
             local class
@@ -68,12 +70,50 @@ suspend_nvidia() {
                 local vendor
                 vendor=$(cat "$card/vendor" 2>/dev/null)
                 if [[ "$vendor" == "0x10de" ]]; then
-                    # NVIDIA GPU — enable runtime PM and force suspend
+                    local pci_addr driver
+                    pci_addr=$(basename "$card")
+                    driver=$(basename "$(readlink "$card/driver")" 2>/dev/null)
+                    if [[ -n "$driver" ]]; then
+                        echo "$pci_addr" > "$STATE_FILE.nvidia"
+                        echo "$driver" >> "$STATE_FILE.nvidia"
+                        echo "$pci_addr" > "/sys/bus/pci/drivers/$driver/unbind" 2>/dev/null
+                    fi
+                    # Also force runtime PM in case unbind fails
                     echo "auto" > "$card/power/control" 2>/dev/null
                 fi
             fi
         fi
     done
+}
+
+resume_nvidia() {
+    if [[ -f "$STATE_FILE.nvidia" ]]; then
+        local pci_addr driver
+        pci_addr=$(sed -n '1p' "$STATE_FILE.nvidia")
+        driver=$(sed -n '2p' "$STATE_FILE.nvidia")
+        if [[ -n "$pci_addr" && -n "$driver" && -f "/sys/bus/pci/drivers/$driver/bind" ]]; then
+            echo "$pci_addr" > "/sys/bus/pci/drivers/$driver/bind" 2>/dev/null
+        fi
+        rm -f "$STATE_FILE.nvidia"
+    fi
+}
+
+suspend_bluetooth() {
+    # Power down Bluetooth radio — can draw 0.5-2 W in s2idle
+    if command -v rfkill &>/dev/null; then
+        # Check if BT was on so we can restore it
+        if rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: no"; then
+            echo "on" > "$STATE_FILE.bt"
+        fi
+        rfkill block bluetooth 2>/dev/null
+    fi
+}
+
+resume_bluetooth() {
+    if [[ -f "$STATE_FILE.bt" ]]; then
+        rfkill unblock bluetooth 2>/dev/null
+        rm -f "$STATE_FILE.bt"
+    fi
 }
 
 suspend_wifi() {
@@ -145,7 +185,7 @@ power_up_nvme() {
 
 save_current_profile() {
     # Save which ghelper power mode is active so we can restore it on resume
-    # Check if on AC or battery
+    # Also save the asusctl profile so we can restore it too
     for ps_path in /sys/class/power_supply/*; do
         local ps_type
         ps_type=$(cat "$ps_path/type" 2>/dev/null)
@@ -157,6 +197,12 @@ save_current_profile() {
             else
                 echo "battery" > "$STATE_FILE"
             fi
+            # Save asusctl profile name
+            local profile_out
+            profile_out=$(asusctl profile get 2>/dev/null)
+            if [[ -n "$profile_out" ]]; then
+                echo "$profile_out" > "$STATE_FILE.asusctl"
+            fi
             return
         fi
     done
@@ -164,11 +210,35 @@ save_current_profile() {
 }
 
 restore_profile() {
-    # Re-apply the ghelper power profile that was active before sleep
+    # Re-apply the full ghelper power profile that was active before sleep
     if [[ -f "$STATE_FILE" ]]; then
         local mode
         mode=$(cat "$STATE_FILE")
+
+        # 1. Low-level kernel power tweaks (EPP, boost, ASPM, PCI-PM, etc.)
         /usr/local/bin/ghelper-power "$mode" 2>/dev/null
+
+        # 2. Restore the asusctl platform profile (Quiet/Balanced/Performance)
+        if [[ -f "$STATE_FILE.asusctl" ]]; then
+            local profile_line profile_name
+            profile_line=$(cat "$STATE_FILE.asusctl")
+            # Parse "Active profile: Quiet" → "Quiet"
+            for p in Quiet Balanced Performance; do
+                if echo "$profile_line" | grep -qi "$p"; then
+                    profile_name="$p"
+                    break
+                fi
+            done
+            if [[ -n "$profile_name" ]]; then
+                asusctl profile set "$profile_name" 2>/dev/null
+            fi
+            rm -f "$STATE_FILE.asusctl"
+        fi
+
+        # 3. Signal the GUI app to re-apply its full profile
+        #    (fan curves, refresh rate, EPP preference, kbd brightness, etc.)
+        echo "$mode" > /tmp/ghelper-wake-signal
+
         rm -f "$STATE_FILE"
     fi
 }
@@ -187,7 +257,10 @@ case "$1" in
         # Power down WiFi (MediaTek MT7922 draws ~2-3W in s2idle otherwise)
         suspend_wifi
 
-        # Ensure NVIDIA dGPU is powered off
+        # Power down Bluetooth radio
+        suspend_bluetooth
+
+        # Unbind NVIDIA dGPU driver to fully power it off
         suspend_nvidia
 
         # Force USB devices to suspend
@@ -196,8 +269,8 @@ case "$1" in
         # NVMe to deepest power state
         power_down_nvme
 
-        # Audio codec — immediate power save
-        echo 0 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
+        # Audio codec — power save immediately (1 = 1 second timeout; 0 = DISABLED)
+        echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
 
         # PCIe ASPM — deepest possible
         echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
@@ -228,10 +301,16 @@ case "$1" in
         ;;
 
     post)
-        # After resume: restore WiFi, wakeup sources, and the active profile
+        # After resume: restore devices and re-apply the full active profile
 
         # Restore WiFi first (user expects connectivity)
         resume_wifi
+
+        # Restore Bluetooth
+        resume_bluetooth
+
+        # Rebind NVIDIA dGPU driver
+        resume_nvidia
 
         # Restore wakeup sources
         restore_wakeup
@@ -239,8 +318,8 @@ case "$1" in
         # NVMe back to normal
         power_up_nvme
 
-        # Re-apply the ghelper power profile (battery or ac)
-        # This restores EPP, boost, ASPM, GPU DPM, fan curves, etc.
+        # Re-apply the ghelper power profile (kernel tweaks + asusctl profile)
+        # Also signals the GUI app to re-apply fan/refresh/EPP/kbd settings
         restore_profile
         ;;
 esac
