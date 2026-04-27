@@ -392,17 +392,24 @@ class Backend:
 class StatusWorker(QThread):
     done = pyqtSignal(dict)
 
+    def __init__(self, lightweight=False):
+        super().__init__()
+        self._lightweight = lightweight
+
     def run(self):
-        self.done.emit({
-            "profile":   Backend.get_profile(),
-            "kbd":       Backend.get_kbd_brightness(),
+        data = {
             "battery":   Backend.get_battery(),
-            "gpu":       Backend.get_gpu_mode(),
             "temps":     Backend.get_temps(),
-            "display":   Backend.get_display_info(),
             "cpu_boost": Backend.get_cpu_boost(),
             "epp":       Backend.get_epp(),
-        })
+        }
+        if not self._lightweight:
+            # These spawn subprocesses — skip on battery to reduce wakeups
+            data["profile"] = Backend.get_profile()
+            data["kbd"]     = Backend.get_kbd_brightness()
+            data["gpu"]     = Backend.get_gpu_mode()
+            data["display"] = Backend.get_display_info()
+        self.done.emit(data)
 
 
 class GpuSwitchWorker(QThread):
@@ -1005,10 +1012,18 @@ class MainWindow(QWidget):
         self._timer.start(5000)
         QTimer.singleShot(0, self._refresh)
 
+    def _adjust_poll_interval(self):
+        """Use slower polling on battery to reduce CPU wakeups and power draw."""
+        on_ac = self._last_ac_status
+        interval = 5000 if on_ac else 15000
+        if self._timer.interval() != interval:
+            self._timer.setInterval(interval)
+
     def _refresh(self):
         if self._worker and self._worker.isRunning():
             return
-        self._worker = StatusWorker()
+        on_battery = self._last_ac_status is False
+        self._worker = StatusWorker(lightweight=on_battery)
         self._worker.done.connect(self._apply_status)
         self._worker.start()
 
@@ -1020,17 +1035,21 @@ class MainWindow(QWidget):
         display = s.get("display")
 
         # If ghelper has an intended profile and the system drifted (e.g.
-        # power-profiles-daemon or asusd reverted it), re-apply our choice
-        # instead of silently accepting the external change.
-        if (self._intended_profile
-                and profile != self._intended_profile
-                and profile != "Unknown"):
-            Backend.set_profile(self._intended_profile)
-            profile = self._intended_profile
+        # power-profiles-daemon or asusd reverted it), re-apply our choice.
+        # Only runs when profile/kbd/gpu were polled (full mode, not lightweight).
+        if "profile" in s:
+            if (self._intended_profile
+                    and profile != self._intended_profile
+                    and profile != "Unknown"):
+                Backend.set_profile(self._intended_profile)
+                profile = self._intended_profile
+            self._profile.set_active(profile)
 
-        self._profile.set_active(profile)
-        self._kbd.set_active(kbd)
-        self._gpu.set_active(self._gpu_pending or s.get("gpu", "Unknown"))
+        if "kbd" in s:
+            self._kbd.set_active(kbd)
+
+        if "gpu" in s:
+            self._gpu.set_active(self._gpu_pending or s.get("gpu", "Unknown"))
 
         # Temperatures
         def _temp_color(t):
@@ -1121,6 +1140,9 @@ class MainWindow(QWidget):
 
         # AC/DC auto profile switch
         self._check_ac_auto_switch(bat.get("status", "Unknown"))
+
+        # Adjust poll rate: 15s on battery, 5s on AC
+        self._adjust_poll_interval()
 
     # ---------------------------------------------------------------- close → hide
 
