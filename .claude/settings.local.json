@@ -88,7 +88,9 @@
       "Bash(cat /sys/class/power_supply/*/online)",
       "Bash(cat /sys/class/power_supply/BAT*/status)",
       "Bash(auto-cpufreq --stats)",
-      "Bash(journalctl:*)"
+      "Bash(journalctl:*)",
+      "Bash(pkexec *)",
+      "Bash(lsusb)"
     ]
   }
 }

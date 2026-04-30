@@ -45,16 +45,31 @@ reset_cpu_max_freq() {
     done
 }
 
+is_usb_hid_or_hub() {
+    local dev="$1"
+    for intf in "$dev"/*:*/bInterfaceClass; do
+        local cls
+        cls=$(cat "$intf" 2>/dev/null)
+        # 03 = HID (mice, keyboards), 09 = Hub
+        [[ "$cls" == "03" || "$cls" == "09" ]] && return 0
+    done
+    return 1
+}
+
 set_usb_autosuspend() {
     local val="$1"  # autosuspend delay in seconds (-1 = disabled, 1 = 1s)
-    for f in /sys/bus/usb/devices/*/power/autosuspend_delay_ms; do
-        echo $(( val * 1000 )) > "$f" 2>/dev/null
-    done
-    for f in /sys/bus/usb/devices/*/power/control; do
+    for dev in /sys/bus/usb/devices/*/; do
+        [[ -f "$dev/power/control" ]] || continue
+        if is_usb_hid_or_hub "$dev"; then
+            echo "on" > "$dev/power/control" 2>/dev/null
+            echo -1000 > "$dev/power/autosuspend_delay_ms" 2>/dev/null
+            continue
+        fi
+        echo $(( val * 1000 )) > "$dev/power/autosuspend_delay_ms" 2>/dev/null
         if [[ "$val" -ge 0 ]]; then
-            echo "auto" > "$f" 2>/dev/null
+            echo "auto" > "$dev/power/control" 2>/dev/null
         else
-            echo "on" > "$f" 2>/dev/null
+            echo "on" > "$dev/power/control" 2>/dev/null
         fi
     done
 }
