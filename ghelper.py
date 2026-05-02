@@ -821,19 +821,8 @@ class MainWindow(QWidget):
         _save_setting("gpu", mode)
         self._sync_power_mode()
         cur_gpu = Backend.get_gpu_mode()
-        needs_reboot = mode == "Dedicated" or cur_gpu == "Dedicated"
-        if needs_reboot:
-            self._set_status(f"GPU → {mode}  Rebooting (MUX switch)…", "#0ea5e9")
-            QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
-        else:
-            self._set_status(f"GPU → {mode}  Restarting session…", "#0ea5e9")
-            QTimer.singleShot(1500, lambda: _run(
-                "dbus-send --session --type=method_call "
-                "--dest=org.gnome.SessionManager "
-                "/org/gnome/SessionManager "
-                "org.gnome.SessionManager.Logout uint32:1",
-                timeout=10
-            ))
+        self._set_status(f"GPU → {mode}  Rebooting…", "#0ea5e9")
+        QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
     def _do_limit(self, limit):
         ok, msg = Backend.set_charge_limit(limit)

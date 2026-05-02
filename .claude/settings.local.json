@@ -90,7 +90,16 @@
       "Bash(auto-cpufreq --stats)",
       "Bash(journalctl:*)",
       "Bash(pkexec *)",
-      "Bash(lsusb)"
+      "Bash(lsusb)",
+      "Read(//sys/bus/pci/devices/0000:01:00.0/power/**)",
+      "Read(//sys/bus/pci/devices/**)",
+      "Bash(flatpak list *)",
+      "Bash(snap list *)",
+      "Bash(pacman -Qs rog)",
+      "Bash(rpm -qa)",
+      "Bash(dpkg -l)",
+      "Read(//usr/share/applications/**)",
+      "Bash(sudo dnf *)"
     ]
   }
 }
