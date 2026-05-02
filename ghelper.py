@@ -50,6 +50,26 @@ def _sysfs(path):
 _power_samples: collections.deque = collections.deque(maxlen=12)
 
 # ---------------------------------------------------------------------------
+# Service health checks
+# ---------------------------------------------------------------------------
+
+
+def _ensure_service(name: str) -> bool:
+    _, _, rc = _run(f"systemctl is-active {name}")
+    if rc == 0:
+        return True
+    _, _, rc = _run(f"sudo systemctl start {name}", timeout=15)
+    return rc == 0
+
+
+def _ensure_asusd() -> bool:
+    return _ensure_service("asusd")
+
+
+def _ensure_supergfxd() -> bool:
+    return _ensure_service("supergfxd")
+
+# ---------------------------------------------------------------------------
 # Persistent settings
 # ---------------------------------------------------------------------------
 
@@ -104,6 +124,7 @@ class Backend:
 
     @staticmethod
     def set_profile(profile):
+        _ensure_asusd()
         asusctl_name = _PROFILE_TO_ASUSCTL.get(profile, profile)
         out, err, rc = _run(f"asusctl profile set {asusctl_name}")
         return rc == 0, err or out
@@ -119,11 +140,13 @@ class Backend:
 
     @staticmethod
     def set_kbd_brightness(level):
+        _ensure_asusd()
         out, err, rc = _run(f"asusctl leds set {level.lower()}")
         return rc == 0, err or out
 
     @staticmethod
     def set_slash(enabled):
+        _ensure_asusd()
         flag = "--enable" if enabled else "--disable"
         out, err, rc = _run(f"asusctl slash {flag}")
         return rc == 0, err or out
@@ -193,13 +216,13 @@ class Backend:
 
     @staticmethod
     def set_charge_limit(limit):
+        _ensure_asusd()
         out, err, rc = _run(f"asusctl battery limit {limit}")
         return rc == 0, err or out
 
 
     @staticmethod
     def set_epp(pref: str):
-        import glob as _glob
         try:
             for f in _glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"):
                 with open(f, "w") as fh:
@@ -243,6 +266,7 @@ class Backend:
 
     @staticmethod
     def set_gpu_mode(mode):
+        _ensure_supergfxd()
         sgfx_mode = Backend._GPU_TO_SUPERGFX.get(mode, mode)
         # MUX switches (AsusMuxDgpu) take significantly longer than hybrid/integrated
         timeout = 180 if sgfx_mode == "AsusMuxDgpu" else 60
@@ -269,6 +293,7 @@ class Backend:
 
     @staticmethod
     def set_fan_preset(preset):
+        _ensure_asusd()
         data = FAN_PRESETS.get(preset)
         if not data:
             return False, "Unknown preset"
@@ -820,7 +845,6 @@ class MainWindow(QWidget):
         self._gpu_pending = mode
         _save_setting("gpu", mode)
         self._sync_power_mode()
-        cur_gpu = Backend.get_gpu_mode()
         self._set_status(f"GPU → {mode}  Rebooting…", "#0ea5e9")
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
@@ -1158,6 +1182,9 @@ class GHelperApp:
         self.app.setApplicationName("G-Helper")
         self.app.setQuitOnLastWindowClosed(False)
         self.app.setStyleSheet(STYLE)
+
+        _ensure_asusd()
+        _ensure_supergfxd()
 
         self.win = MainWindow()
         self._build_tray()

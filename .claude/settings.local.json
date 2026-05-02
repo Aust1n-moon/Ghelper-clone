@@ -99,7 +99,10 @@
       "Bash(rpm -qa)",
       "Bash(dpkg -l)",
       "Read(//usr/share/applications/**)",
-      "Bash(sudo dnf *)"
+      "Bash(sudo dnf *)",
+      "Read(//usr/bin/**)",
+      "Read(//usr/**)",
+      "Bash(dnf search *)"
     ]
   }
 }
