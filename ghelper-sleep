@@ -117,39 +117,41 @@ resume_bluetooth() {
 }
 
 suspend_wifi() {
-    # Unbind the WiFi adapter to fully power it down during sleep
-    # MediaTek MT7922 is known to draw significant power in s2idle
-    local wifi_pci
-    for dev in /sys/bus/pci/devices/*/; do
-        if [[ -f "$dev/class" ]]; then
-            local class
-            class=$(cat "$dev/class" 2>/dev/null)
-            # 0x028000 = Network controller (wireless)
-            if [[ "$class" == "0x028000" ]]; then
-                wifi_pci=$(basename "$dev")
-                echo "$wifi_pci" > "$STATE_FILE.wifi"
-                # Save the driver binding
-                local driver
-                driver=$(basename "$(readlink "$dev/driver")" 2>/dev/null)
-                echo "$driver" >> "$STATE_FILE.wifi"
-                # Unbind
-                if [[ -n "$driver" && -f "/sys/bus/pci/drivers/$driver/unbind" ]]; then
-                    echo "$wifi_pci" > "/sys/bus/pci/drivers/$driver/unbind" 2>/dev/null
-                fi
-                break
-            fi
+    # Fully unload the mt7921e driver before suspend. On resume, reloading
+    # the module forces a clean firmware reinit — the only reliable way to
+    # restore MT7922 WiFi after s2idle. (PCI unbind/rebind is insufficient;
+    # it skips firmware reload and leaves the device in a broken state.)
+    if lsmod | grep -q mt7921e; then
+        local conn
+        conn=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
+               | grep ':wlp3s0$' | cut -d: -f1)
+        if [[ -n "$conn" ]]; then
+            echo "$conn" > "$STATE_FILE.wifi"
         fi
-    done
+        nmcli device disconnect wlp3s0 2>/dev/null
+        # Block d3cold before unload — prevents the PCI subsystem from
+        # parking the device in a state the firmware can't recover from.
+        echo 0 > /sys/bus/pci/devices/0000:03:00.0/d3cold_allowed 2>/dev/null
+        modprobe -r mt7921e 2>/dev/null
+    fi
 }
 
 resume_wifi() {
+    if ! lsmod | grep -q mt7921e; then
+        modprobe mt7921e 2>/dev/null
+        local i
+        for i in $(seq 1 10); do
+            ip link show wlp3s0 &>/dev/null && break
+            sleep 0.5
+        done
+    fi
+
     if [[ -f "$STATE_FILE.wifi" ]]; then
-        local wifi_pci driver
-        wifi_pci=$(sed -n '1p' "$STATE_FILE.wifi")
-        driver=$(sed -n '2p' "$STATE_FILE.wifi")
-        if [[ -n "$wifi_pci" && -n "$driver" && -f "/sys/bus/pci/drivers/$driver/bind" ]]; then
-            echo "$wifi_pci" > "/sys/bus/pci/drivers/$driver/bind" 2>/dev/null
-        fi
+        local conn
+        conn=$(cat "$STATE_FILE.wifi")
+        sleep 1
+        nmcli device connect wlp3s0 2>/dev/null || \
+            nmcli connection up "$conn" 2>/dev/null
         rm -f "$STATE_FILE.wifi"
     fi
 }
@@ -259,7 +261,7 @@ case "$1" in
         # Disable wakeup sources that cause spurious wakes and power drain
         disable_wakeup
 
-        # Power down WiFi (MediaTek MT7922 draws ~2-3W in s2idle otherwise)
+        # Unload WiFi driver — module reload on resume forces clean firmware init
         suspend_wifi
 
         # Power down Bluetooth radio
@@ -280,8 +282,9 @@ case "$1" in
         # PCIe ASPM — deepest possible
         echo powersupersave > /sys/module/pcie_aspm/parameters/policy 2>/dev/null
 
-        # All PCI devices to auto PM
+        # All PCI devices to auto PM (skip WiFi — already unloaded above)
         for f in /sys/bus/pci/devices/*/power/control; do
+            [[ "$f" == *"0000:03:00.0"* ]] && continue
             echo "auto" > "$f" 2>/dev/null
         done
 

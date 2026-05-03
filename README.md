@@ -60,6 +60,8 @@ The script will:
 2. Install the **GNOME AppIndicator** extension for tray icon support on Wayland
 3. Add a **desktop launcher** entry to `~/.local/share/applications/`
 4. Set up an **autostart entry** so G-Helper launches automatically on login
+5. Install the **sleep/suspend hook** to `/usr/lib/systemd/system-sleep/` (reduces s2idle power draw)
+6. Install a **udev rule** to disable PCI D3cold for the MT7922 WiFi adapter (prevents firmware reinit failures after suspend)
 
 ### 3. Launch
 
@@ -100,6 +102,18 @@ Or install it from [extensions.gnome.org](https://extensions.gnome.org/extension
 ## Configuration
 
 Settings are stored at `~/.config/ghelper.json` and updated automatically as you make changes in the UI. You do not need to edit this file manually.
+
+---
+
+## Sleep / Suspend
+
+The install script places a systemd sleep hook (`ghelper-sleep`) that runs before and after suspend to minimize s2idle power draw and ensure reliable resume. Key behaviors:
+
+- **WiFi (MT7922)** — The `mt7921e` kernel module is fully unloaded before suspend and reloaded on resume, forcing a clean firmware reinit. A udev rule (`99-mt7922-no-d3cold.rules`) disables PCI D3cold for the adapter to prevent the firmware from entering a state it cannot recover from.
+- **NVIDIA dGPU** — Driver is unbound before suspend and rebound on resume to guarantee the GPU is fully powered off during sleep.
+- **Bluetooth** — Radio is blocked via `rfkill` before suspend and restored on resume if it was previously enabled.
+- **USB / NVMe / CPU / iGPU** — Aggressively power-gated during sleep (USB autosuspend, NVMe deep power state, CPU boost off, AMDGPU low power).
+- **Profile restore** — The active ghelper power profile and `asusctl` platform profile are saved before suspend and fully reapplied on resume, including signaling the GUI to restore fan curves, refresh rate, and keyboard backlight.
 
 ---
 
