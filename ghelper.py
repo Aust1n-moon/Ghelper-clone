@@ -271,11 +271,6 @@ class Backend:
         # MUX switches (AsusMuxDgpu) take significantly longer than hybrid/integrated
         timeout = 180 if sgfx_mode == "AsusMuxDgpu" else 60
         out, err, rc = _run(f"supergfxctl -m {sgfx_mode}", timeout=timeout)
-        if rc == 0:
-            # supergfxctl sets a pending mode that requires logout to apply,
-            # but a reboot may kill supergfxd before it persists the change.
-            # Write directly to supergfxd's config so the mode survives reboot.
-            _run(f"sudo /usr/local/bin/ghelper-power gpu {sgfx_mode}", timeout=5)
         return rc == 0, err or out
 
     @staticmethod
@@ -587,7 +582,6 @@ class MainWindow(QWidget):
         self._worker = None
         self._gpu_worker = None
         self._gpu_pending = None
-        self._rebooting = False
         self._restore_settings()
         self._schedule_refresh()
 
@@ -664,7 +658,7 @@ class MainWindow(QWidget):
         self._epp_label = QLabel("EPP: –")
         self._epp_label.setStyleSheet("color: #64748b; font-size: 11px;")
         gl.addWidget(self._epp_label)
-        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · fan · display · kbd · slash)")
+        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display · kbd · slash)")
         self._auto_switch.setChecked(_load_settings().get("auto_switch", True))
         self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
         self._auto_switch.toggled.connect(lambda v: _save_setting("auto_switch", v))
@@ -794,10 +788,12 @@ class MainWindow(QWidget):
         self._status.setStyleSheet(f"color: {color}; font-size: 11px; padding: 2px;")
 
     def _is_battery_mode_active(self):
-        """Battery optimizations only apply when LowPower profile is active."""
+        """Battery optimizations only apply when LowPower profile + Integrated GPU."""
         profile_ok = self._profile.buttons.get("LowPower") and \
                      self._profile.buttons["LowPower"].isChecked()
-        return bool(profile_ok)
+        gpu_ok = self._gpu.buttons.get("Integrated") and \
+                 self._gpu.buttons["Integrated"].isChecked()
+        return bool(profile_ok and gpu_ok)
 
     def _sync_power_mode(self):
         """Apply battery or AC tweaks based on current profile + GPU selection."""
@@ -848,7 +844,7 @@ class MainWindow(QWidget):
             return
         self._gpu_pending = mode
         _save_setting("gpu", mode)
-        self._rebooting = True
+        self._sync_power_mode()
         self._set_status(f"GPU → {mode}  Rebooting…", "#0ea5e9")
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
@@ -935,7 +931,15 @@ class MainWindow(QWidget):
             self._kbd.set_active("Off")
             Backend.set_slash(False)
             self._slash_off_btn.setChecked(True)
-            self._set_status("Unplugged → full battery mode active", "#f59e0b")
+            if not first_launch:
+                cur_gpu = Backend.get_gpu_mode()
+                if cur_gpu != "Integrated":
+                    self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
+                    self._do_gpu("Integrated")
+                else:
+                    self._set_status("Unplugged → full battery mode active", "#f59e0b")
+            else:
+                self._set_status("Unplugged → full battery mode active", "#f59e0b")
 
         elif was_battery and now_on_ac:
             # AC: Balanced + AC power tweaks + Balanced fan + Native
@@ -951,8 +955,15 @@ class MainWindow(QWidget):
             self._power_mode.set_active("AC")
             Backend.set_kbd_brightness("Low")
             self._kbd.set_active("Low")
-            self._set_status("Plugged in → AC mode active", "#0ea5e9")
-
+            if not first_launch:
+                cur_gpu = Backend.get_gpu_mode()
+                if cur_gpu != "Integrated":
+                    self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
+                    self._do_gpu("Integrated")
+                else:
+                    self._set_status("Unplugged → full battery mode active", "#f59e0b")
+            else:
+                self._set_status("Unplugged → full battery mode active", "#f59e0b")
     # ---------------------------------------------------------------- restore saved settings
 
     def _restore_settings(self):
@@ -974,8 +985,9 @@ class MainWindow(QWidget):
         if fan and fan in self._fan.buttons:
             self._fan.set_active(fan)
             # Re-apply in background so fan curve survives reboots
+        if not self._auto_switch.isChecked():
             import threading
-            threading.Thread(target=Backend.set_fan_preset, args=(fan,), daemon=True).start()
+            threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
 
         kbd = s.get("kbd")
         if kbd and kbd in self._kbd.buttons:
@@ -1176,7 +1188,11 @@ class GHelperApp:
         self.win.show()
 
     def _on_quit(self):
-        pass
+        # Only reset GPU on exit when auto-switch is managing the GPU mode.
+        # When the user has manually chosen a mode (e.g. Dedicated), respect it
+        # across restarts by leaving the saved setting intact.
+        if self.win._auto_switch.isChecked():
+            Backend.set_gpu_mode("Integrated")
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(_make_icon(), self.app)

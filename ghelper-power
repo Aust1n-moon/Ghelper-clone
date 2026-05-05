@@ -194,24 +194,6 @@ epp)
     fi
     set_epp "$EPP_ARG"
     ;;
-
-gpu)
-    VALID="Integrated Hybrid AsusMuxDgpu"
-    if [[ -z "$EPP_ARG" ]] || ! echo "$VALID" | grep -qw "$EPP_ARG"; then
-        echo "Usage: ghelper-power gpu <Integrated|Hybrid|AsusMuxDgpu>" >&2
-        exit 1
-    fi
-    CONF="/etc/supergfxd.conf"
-    if [[ -f "$CONF" ]]; then
-        python3 -c "
-import json, sys
-d = json.loads(open('$CONF').read())
-d['mode'] = '$EPP_ARG'
-open('$CONF', 'w').write(json.dumps(d, indent=2))
-"
-    fi
-    ;;
-
 *)
     echo "Usage: ghelper-power battery|ac|epp|gpu [arg]" >&2
     exit 1

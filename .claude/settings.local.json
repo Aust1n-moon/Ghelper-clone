@@ -127,7 +127,9 @@
       "Bash(wlr-randr)",
       "Bash(wpctl set-default *)",
       "Bash(wireplumber --version)",
-      "Bash(wpctl inspect *)"
+      "Bash(wpctl inspect *)",
+      "Read(//sys/module/pcie_aspm/parameters/**)",
+      "Read(//proc/sys/vm/**)"
     ]
   }
 }
