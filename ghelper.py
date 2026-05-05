@@ -271,6 +271,11 @@ class Backend:
         # MUX switches (AsusMuxDgpu) take significantly longer than hybrid/integrated
         timeout = 180 if sgfx_mode == "AsusMuxDgpu" else 60
         out, err, rc = _run(f"supergfxctl -m {sgfx_mode}", timeout=timeout)
+        if rc == 0:
+            # supergfxctl sets a pending mode that requires logout to apply,
+            # but a reboot may kill supergfxd before it persists the change.
+            # Write directly to supergfxd's config so the mode survives reboot.
+            _run(f"sudo /usr/local/bin/ghelper-power gpu {sgfx_mode}", timeout=5)
         return rc == 0, err or out
 
     @staticmethod
@@ -843,7 +848,6 @@ class MainWindow(QWidget):
             return
         self._gpu_pending = mode
         _save_setting("gpu", mode)
-        self._sync_power_mode()
         self._rebooting = True
         self._set_status(f"GPU → {mode}  Rebooting…", "#0ea5e9")
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
@@ -982,9 +986,8 @@ class MainWindow(QWidget):
         if gpu not in self._gpu.buttons:
             gpu = "Integrated"
         self._gpu.set_active(gpu)
-        if not self._auto_switch.isChecked():
-            import threading
-            threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
+        import threading
+        threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
 
         slash = s.get("slash")
         if slash is not None:

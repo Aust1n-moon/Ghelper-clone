@@ -111,7 +111,23 @@
       "Read(//etc/NetworkManager/**)",
       "Read(//etc/modprobe.d/**)",
       "Read(//etc/udev/rules.d/**)",
-      "Bash(modinfo mt7921e *)"
+      "Bash(modinfo mt7921e *)",
+      "Bash(pkill -f \"python.*ghelper.py\")",
+      "Bash(nohup python3 ghelper.py)",
+      "Read(//var/lib/**)",
+      "Read(//run/**)",
+      "Read(//tmp/**)",
+      "Read(//etc/**)",
+      "Read(//etc/supergfxd/**)",
+      "Bash(sudo supergfxctl -m Hybrid)",
+      "Bash(sudo -l)",
+      "Bash(pactl list *)",
+      "Bash(pactl get-default-sink *)",
+      "Bash(wpctl status *)",
+      "Bash(wlr-randr)",
+      "Bash(wpctl set-default *)",
+      "Bash(wireplumber --version)",
+      "Bash(wpctl inspect *)"
     ]
   }
 }
