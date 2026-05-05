@@ -582,6 +582,7 @@ class MainWindow(QWidget):
         self._worker = None
         self._gpu_worker = None
         self._gpu_pending = None
+        self._rebooting = False
         self._restore_settings()
         self._schedule_refresh()
 
@@ -658,7 +659,7 @@ class MainWindow(QWidget):
         self._epp_label = QLabel("EPP: –")
         self._epp_label.setStyleSheet("color: #64748b; font-size: 11px;")
         gl.addWidget(self._epp_label)
-        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display · kbd · slash)")
+        self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · fan · display · kbd · slash)")
         self._auto_switch.setChecked(_load_settings().get("auto_switch", True))
         self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
         self._auto_switch.toggled.connect(lambda v: _save_setting("auto_switch", v))
@@ -788,12 +789,10 @@ class MainWindow(QWidget):
         self._status.setStyleSheet(f"color: {color}; font-size: 11px; padding: 2px;")
 
     def _is_battery_mode_active(self):
-        """Battery optimizations only apply when LowPower profile + Integrated GPU."""
+        """Battery optimizations only apply when LowPower profile is active."""
         profile_ok = self._profile.buttons.get("LowPower") and \
                      self._profile.buttons["LowPower"].isChecked()
-        gpu_ok = self._gpu.buttons.get("Integrated") and \
-                 self._gpu.buttons["Integrated"].isChecked()
-        return bool(profile_ok and gpu_ok)
+        return bool(profile_ok)
 
     def _sync_power_mode(self):
         """Apply battery or AC tweaks based on current profile + GPU selection."""
@@ -845,6 +844,7 @@ class MainWindow(QWidget):
         self._gpu_pending = mode
         _save_setting("gpu", mode)
         self._sync_power_mode()
+        self._rebooting = True
         self._set_status(f"GPU → {mode}  Rebooting…", "#0ea5e9")
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
@@ -916,7 +916,7 @@ class MainWindow(QWidget):
         now_on_ac   = current_on_ac is True
 
         if was_on_ac and now_battery:
-            # Battery: LowPower + Integrated GPU + all power tweaks + Silent fan + 60 Hz + kbd/slash off
+            # Battery: LowPower + all power tweaks + Silent fan + 60 Hz + kbd/slash off
             Backend.set_profile("LowPower")
             self._intended_profile = "LowPower"
             _save_setting("profile", "LowPower")
@@ -925,26 +925,16 @@ class MainWindow(QWidget):
             self._fan.set_active("Silent")
             self._do_refresh(60)
             self._refresh_rate.set_active("60 Hz")
-            # Apply full battery power tweaks (EPP + boost off + ASPM + PCI-PM + NMI + writeback)
             self._do_power_mode("battery")
             self._power_mode.set_active("Battery")
-            # Keyboard backlight off, slash LED off
             Backend.set_kbd_brightness("Off")
             self._kbd.set_active("Off")
             Backend.set_slash(False)
             self._slash_off_btn.setChecked(True)
-            if not first_launch:
-                cur_gpu = Backend.get_gpu_mode()
-                if cur_gpu != "Integrated":
-                    self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
-                    self._do_gpu("Integrated")
-                else:
-                    self._set_status("Unplugged → full battery mode active", "#f59e0b")
-            else:
-                self._set_status("Unplugged → full battery mode active", "#f59e0b")
+            self._set_status("Unplugged → full battery mode active", "#f59e0b")
 
         elif was_battery and now_on_ac:
-            # AC: Balanced + Hybrid GPU + AC power tweaks + Balanced fan + Native
+            # AC: Balanced + AC power tweaks + Balanced fan + Native
             Backend.set_profile("Balanced")
             self._intended_profile = "Balanced"
             _save_setting("profile", "Balanced")
@@ -953,21 +943,11 @@ class MainWindow(QWidget):
             self._fan.set_active("Balanced")
             self._do_refresh(None)  # Native
             self._refresh_rate.set_active("Native")
-            # Apply AC power tweaks (EPP + boost on + ASPM default + NMI + writeback)
             self._do_power_mode("ac")
             self._power_mode.set_active("AC")
-            # Keyboard backlight restore to Low
             Backend.set_kbd_brightness("Low")
             self._kbd.set_active("Low")
-            if not first_launch:
-                cur_gpu = Backend.get_gpu_mode()
-                if cur_gpu != "Hybrid":
-                    self._set_status("Plugged in → AC mode · switching GPU to Hybrid…", "#0ea5e9")
-                    self._do_gpu("Hybrid")
-                else:
-                    self._set_status("Plugged in → AC mode active", "#0ea5e9")
-            else:
-                self._set_status("Plugged in → AC mode active", "#0ea5e9")
+            self._set_status("Plugged in → AC mode active", "#0ea5e9")
 
     # ---------------------------------------------------------------- restore saved settings
 
@@ -1002,8 +982,9 @@ class MainWindow(QWidget):
         if gpu not in self._gpu.buttons:
             gpu = "Integrated"
         self._gpu.set_active(gpu)
-        import threading
-        threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
+        if not self._auto_switch.isChecked():
+            import threading
+            threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
 
         slash = s.get("slash")
         if slash is not None:
@@ -1192,11 +1173,7 @@ class GHelperApp:
         self.win.show()
 
     def _on_quit(self):
-        # Only reset GPU on exit when auto-switch is managing the GPU mode.
-        # When the user has manually chosen a mode (e.g. Dedicated), respect it
-        # across restarts by leaving the saved setting intact.
-        if self.win._auto_switch.isChecked():
-            Backend.set_gpu_mode("Integrated")
+        pass
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(_make_icon(), self.app)
