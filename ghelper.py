@@ -529,7 +529,7 @@ class GpuSwitchWorker(QThread):
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def _make_icon(letter="G", bg="#2563eb", size=64):
+def _make_icon(letter="G", bg="#dc2626", size=64):
     px = QPixmap(size, size)
     px.fill(Qt.GlobalColor.transparent)
     p = QPainter(px)
@@ -613,9 +613,9 @@ QPushButton {
     color: #94a3b8;
     min-width: 70px;
 }
-QPushButton:hover   { background-color: #1e293b; border-color: #38bdf8; color: #e2e8f0; }
-QPushButton:checked { background-color: #0ea5e9; border-color: #38bdf8; color: #fff; font-weight: bold; }
-QPushButton:checked:hover { background-color: #38bdf8; }
+QPushButton:hover   { background-color: #1e293b; border-color: #ef4444; color: #e2e8f0; }
+QPushButton:checked { background-color: #dc2626; border-color: #ef4444; color: #fff; font-weight: bold; }
+QPushButton:checked:hover { background-color: #ef4444; }
 QPushButton:disabled { color: #334155; border-color: #0f172a; }
 QProgressBar {
     border: 1px solid #1e293b;
@@ -626,7 +626,7 @@ QProgressBar {
     color: #e2e8f0;
     font-size: 11px;
 }
-QProgressBar::chunk { border-radius: 3px; background-color: #0ea5e9; }
+QProgressBar::chunk { border-radius: 3px; background-color: #dc2626; }
 QFrame[frameShape="4"] { color: #1e293b; }
 QMenu {
     background-color: #0f172a;
@@ -675,7 +675,7 @@ class MainWindow(QWidget):
         hdr_layout.setSpacing(4)
         hdr = QHBoxLayout()
         title = QLabel("G-Helper")
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #38bdf8; letter-spacing: 1px;")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #ef4444; letter-spacing: 1px;")
         self._hdr_status = QLabel("…")
         self._hdr_status.setStyleSheet("color: #475569; font-size: 11px;")
         hdr.addWidget(title)
@@ -810,7 +810,7 @@ class MainWindow(QWidget):
         self._effect_combo.setStyleSheet(
             "QComboBox { background: #0f172a; border: 1px solid #1e293b; border-radius: 4px; "
             "color: #94a3b8; padding: 3px 8px; font-size: 11px; min-width: 100px; }"
-            "QComboBox:hover { border-color: #38bdf8; color: #e2e8f0; }"
+            "QComboBox:hover { border-color: #ef4444; color: #e2e8f0; }"
             "QComboBox::drop-down { border: none; }"
             "QComboBox QAbstractItemView { background: #0f172a; color: #e2e8f0; "
             "border: 1px solid #1e293b; selection-background-color: #1e293b; }"
@@ -938,14 +938,14 @@ class MainWindow(QWidget):
             _save_setting("profile", profile)
             self._sync_power_mode()
         self._set_status(f"Profile → {profile}" if ok else f"Error: {msg[:70]}",
-                         "#0ea5e9" if ok else "#ef4444")
+                         "#dc2626" if ok else "#ef4444")
 
     def _do_kbd(self, level):
         ok, msg = Backend.set_kbd_brightness(level)
         if ok:
             _save_setting("kbd", level)
         self._set_status(f"Keyboard → {level}" if ok else f"Error: {msg[:70]}",
-                         "#0ea5e9" if ok else "#ef4444")
+                         "#dc2626" if ok else "#ef4444")
 
     def _pick_color(self):
         initial = QColor(f"#{self._kbd_color}")
@@ -968,7 +968,7 @@ class MainWindow(QWidget):
             _save_setting("kbd_effect", effect)
         self._set_status(
             f"Aura → {effect} (#{color})" if ok else f"Aura error: {msg[:60]}",
-            "#0ea5e9" if ok else "#ef4444"
+            "#dc2626" if ok else "#ef4444"
         )
 
     def _do_slash(self, enabled):
@@ -976,7 +976,7 @@ class MainWindow(QWidget):
         if ok:
             _save_setting("slash", enabled)
         self._set_status(f"Slash LED → {'On' if enabled else 'Off'}" if ok else f"Error: {msg[:70]}",
-                         "#0ea5e9" if ok else "#ef4444")
+                         "#dc2626" if ok else "#ef4444")
 
     def _do_gpu(self, mode):
         if self._gpu_worker and self._gpu_worker.isRunning():
@@ -996,13 +996,13 @@ class MainWindow(QWidget):
         self._gpu_pending = mode
         _save_setting("gpu", mode)
         self._sync_power_mode()
-        self._set_status(f"GPU → {mode}  Rebooting…", "#0ea5e9")
+        self._set_status(f"GPU → {mode}  Rebooting…", "#dc2626")
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
     def _do_limit(self, limit):
         ok, msg = Backend.set_charge_limit(limit)
         self._set_status(f"Charge limit → {limit}%" if ok else f"Error: {msg[:70]}",
-                         "#0ea5e9" if ok else "#ef4444")
+                         "#dc2626" if ok else "#ef4444")
 
     def _do_fan(self, preset):
         self._set_status(f"Applying fan curve: {preset}…", "#f59e0b")
@@ -1010,7 +1010,7 @@ class MainWindow(QWidget):
         if ok:
             _save_setting("fan_preset", preset)
         self._set_status(f"Fan curve → {preset}" if ok else f"Fan curve error: {msg[:60]}",
-                         "#0ea5e9" if ok else "#ef4444")
+                         "#dc2626" if ok else "#ef4444")
 
     def _do_power_mode(self, mode: str):
         """Apply full low-level power tweaks for 'battery' or 'ac' mode."""
@@ -1020,7 +1020,7 @@ class MainWindow(QWidget):
         self._set_status(
             f"Power tweaks → {label}  (boost·freq·ASPM·PCI-PM·GPU-DPM·WiFi·USB·audio·NMI)"
             if ok else f"Power tweak error: {msg[:60]}",
-            "#0ea5e9" if ok else "#ef4444"
+            "#dc2626" if ok else "#ef4444"
         )
 
     def _do_refresh(self, hz):
@@ -1031,7 +1031,7 @@ class MainWindow(QWidget):
             return
         ok, msg = Backend.set_refresh_rate(hz)
         self._set_status(f"Refresh → {hz} Hz" if ok else f"Error: {msg[:70]}",
-                         "#0ea5e9" if ok else "#ef4444")
+                         "#dc2626" if ok else "#ef4444")
 
     def _check_ac_auto_switch(self, bat_status):
         # Use the AC adapter online file as the authoritative source to avoid
@@ -1248,7 +1248,7 @@ class MainWindow(QWidget):
         if "charge_limit" in bat:
             self._bat_limit.set_active(f"{bat['charge_limit']}%")
 
-        chunk = "#0ea5e9" if cap >= 50 else ("#f59e0b" if cap >= 20 else "#ef4444")
+        chunk = "#dc2626" if cap >= 50 else ("#f59e0b" if cap >= 20 else "#ef4444")
         self._bat_bar.setStyleSheet(
             f"QProgressBar::chunk {{ background-color: {chunk}; border-radius: 3px; }}"
         )
