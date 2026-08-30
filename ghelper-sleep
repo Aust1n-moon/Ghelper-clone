@@ -288,6 +288,16 @@ case "$1" in
             echo "auto" > "$f" 2>/dev/null
         done
 
+        # Keyboard backlight off — save current brightness so we can restore
+        local kbd_bright
+        kbd_bright=$(cat /sys/class/leds/asus::kbd_backlight/brightness 2>/dev/null)
+        if [[ -n "$kbd_bright" ]]; then
+            echo "$kbd_bright" > "$STATE_FILE.kbd"
+            echo 0 > /sys/class/leds/asus::kbd_backlight/brightness 2>/dev/null
+        fi
+        # Also disable the aura keyboard zone during sleep
+        asusctl aura power keyboard 2>/dev/null
+
         # CPU — disable boost and set lowest EPP
         echo 0 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
         for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
@@ -325,6 +335,15 @@ case "$1" in
 
         # NVMe back to normal
         power_up_nvme
+
+        # Restore keyboard backlight
+        if [[ -f "$STATE_FILE.kbd" ]]; then
+            local kbd_bright
+            kbd_bright=$(cat "$STATE_FILE.kbd")
+            asusctl aura power keyboard --awake 2>/dev/null
+            echo "$kbd_bright" > /sys/class/leds/asus::kbd_backlight/brightness 2>/dev/null
+            rm -f "$STATE_FILE.kbd"
+        fi
 
         # Re-apply the ghelper power profile (kernel tweaks + asusctl profile)
         # Also signals the GUI app to re-apply fan/refresh/EPP/kbd settings

@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QButtonGroup, QGroupBox, QSystemTrayIcon,
     QMenu, QFrame, QProgressBar, QCheckBox, QScrollArea,
+    QComboBox, QColorDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
@@ -129,8 +130,22 @@ class Backend:
         out, err, rc = _run(f"asusctl profile set {asusctl_name}")
         return rc == 0, err or out
 
+    # Keyboard brightness: sysfs is ground truth; asusctl sets it; GNOME must
+    # be synced via D-Bus so the system quick-settings slider matches.
+    _KBD_SYSFS = "/sys/class/leds/asus::kbd_backlight/brightness"
+    _KBD_MAX   = "/sys/class/leds/asus::kbd_backlight/max_brightness"
+    _KBD_LEVEL_MAP = {0: "Off", 1: "Low", 2: "Med", 3: "High"}
+    _KBD_LEVEL_TO_INT = {v: k for k, v in _KBD_LEVEL_MAP.items()}
+    # GNOME SettingsDaemon uses percentages (0/33/67/100 for a 4-step backlight)
+    _KBD_GNOME_PCT = {"Off": 0, "Low": 33, "Med": 67, "High": 100}
+
     @staticmethod
     def get_kbd_brightness():
+        """Read directly from sysfs — the actual hardware state."""
+        val = _sysfs(Backend._KBD_SYSFS)
+        if val is not None and val.isdigit():
+            return Backend._KBD_LEVEL_MAP.get(int(val), "Unknown")
+        # Fallback to asusctl
         out, _, rc = _run("asusctl leds get")
         if rc == 0:
             for level in ("Off", "Low", "Med", "High"):
@@ -139,9 +154,70 @@ class Backend:
         return "Unknown"
 
     @staticmethod
+    def _sync_gnome_kbd_brightness(level):
+        """Update GNOME SettingsDaemon's cached brightness so the system
+        quick-settings menu matches what we set via asusctl."""
+        pct = Backend._KBD_GNOME_PCT.get(level)
+        if pct is None or not _DBUS_OK:
+            return
+        try:
+            bus = _dbus.SessionBus()
+            proxy = bus.get_object("org.gnome.SettingsDaemon.Power",
+                                   "/org/gnome/SettingsDaemon/Power")
+            iface = _dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+            iface.Set("org.gnome.SettingsDaemon.Power.Keyboard",
+                      "Brightness", _dbus.Int32(pct))
+        except Exception:
+            pass
+
+    @staticmethod
+    def ensure_kbd_power():
+        """Enable the keyboard aura zone only while awake.
+        Boot/sleep/shutdown stay off to avoid drawing power."""
+        _ensure_asusd()
+        _run("asusctl aura power keyboard --awake")
+
+    @staticmethod
     def set_kbd_brightness(level):
         _ensure_asusd()
         out, err, rc = _run(f"asusctl leds set {level.lower()}")
+        if rc == 0:
+            Backend._sync_gnome_kbd_brightness(level)
+        return rc == 0, err or out
+
+    # ------ Aura RGB effects ------
+    _AURA_EFFECTS = [
+        "static", "breathe", "rainbow-cycle", "rainbow-wave",
+        "stars", "rain", "highlight", "laser", "ripple",
+        "pulse", "comet", "flash",
+    ]
+    # Effects that accept a --colour flag
+    _AURA_COLOR_EFFECTS = {
+        "static", "breathe", "stars", "highlight",
+        "laser", "ripple", "pulse", "comet", "flash",
+    }
+    # Effects that accept --speed
+    _AURA_SPEED_EFFECTS = {
+        "breathe", "rainbow-cycle", "rainbow-wave", "stars",
+        "rain", "highlight", "laser", "ripple",
+    }
+    # Effects that accept --colour2
+    _AURA_COLOR2_EFFECTS = {"breathe", "stars"}
+
+    @staticmethod
+    def set_aura_effect(effect, color=None, color2=None, speed=None):
+        """Apply an aura RGB effect to the keyboard zone.
+        color/color2: hex string like 'ff0000'; speed: 'low'/'med'/'high'."""
+        _ensure_asusd()
+        parts = ["asusctl", "aura", "effect", effect]
+        if color and effect in Backend._AURA_COLOR_EFFECTS:
+            parts += ["--colour", color]
+        # breathe/stars require --colour2; default to black if not provided
+        if effect in Backend._AURA_COLOR2_EFFECTS:
+            parts += ["--colour2", color2 or "000000"]
+        if speed and effect in Backend._AURA_SPEED_EFFECTS:
+            parts += ["--speed", speed]
+        out, err, rc = _run(" ".join(parts))
         return rc == 0, err or out
 
     @staticmethod
@@ -568,7 +644,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("G-Helper")
-        self.setFixedWidth(420)
+        self.setFixedWidth(520)
         self.setWindowFlags(
             Qt.WindowType.Window |
             Qt.WindowType.WindowTitleHint |
@@ -616,10 +692,13 @@ class MainWindow(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setStyleSheet("QScrollBar:vertical { width: 6px; background: #0f172a; }"
                              "QScrollBar::handle:vertical { background: #1e293b; border-radius: 3px; }"
-                             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }")
+                             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+                             "QScrollBar:horizontal { height: 6px; background: #0f172a; }"
+                             "QScrollBar::handle:horizontal { background: #1e293b; border-radius: 3px; }"
+                             "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }")
         content = QWidget()
         root_inner = QVBoxLayout(content)
         root_inner.setSpacing(6)
@@ -712,6 +791,51 @@ class MainWindow(QWidget):
         gl = QVBoxLayout(g)
         self._kbd = _ButtonRow(["Off", "Low", "Med", "High"])
         gl.addWidget(self._kbd)
+
+        # RGB color & effect controls
+        color_row = QHBoxLayout()
+        color_lbl = QLabel("Color:")
+        color_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        self._color_btn = QPushButton("")
+        self._color_btn.setFixedSize(28, 28)
+        self._kbd_color = _load_settings().get("kbd_color", "ffffff")
+        self._color_btn.setStyleSheet(
+            f"background-color: #{self._kbd_color}; border: 1px solid #1e293b; border-radius: 4px;"
+        )
+
+        effect_lbl = QLabel("Effect:")
+        effect_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        self._effect_combo = QComboBox()
+        self._effect_combo.addItems([e.replace("-", " ").title() for e in Backend._AURA_EFFECTS])
+        self._effect_combo.setStyleSheet(
+            "QComboBox { background: #0f172a; border: 1px solid #1e293b; border-radius: 4px; "
+            "color: #94a3b8; padding: 3px 8px; font-size: 11px; min-width: 100px; }"
+            "QComboBox:hover { border-color: #38bdf8; color: #e2e8f0; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView { background: #0f172a; color: #e2e8f0; "
+            "border: 1px solid #1e293b; selection-background-color: #1e293b; }"
+        )
+        saved_effect = _load_settings().get("kbd_effect", "static")
+        try:
+            idx = Backend._AURA_EFFECTS.index(saved_effect)
+            self._effect_combo.setCurrentIndex(idx)
+        except ValueError:
+            pass
+
+        self._apply_aura_btn = QPushButton("Apply")
+        self._apply_aura_btn.setStyleSheet(
+            "QPushButton { min-width: 50px; padding: 4px 10px; font-size: 11px; }"
+        )
+
+        color_row.addWidget(color_lbl)
+        color_row.addWidget(self._color_btn)
+        color_row.addSpacing(8)
+        color_row.addWidget(effect_lbl)
+        color_row.addWidget(self._effect_combo)
+        color_row.addSpacing(8)
+        color_row.addWidget(self._apply_aura_btn)
+        color_row.addStretch()
+        gl.addLayout(color_row)
         root.addWidget(g)
 
         # Slash LED
@@ -760,6 +884,9 @@ class MainWindow(QWidget):
 
         for name, btn in self._kbd.buttons.items():
             btn.clicked.connect(lambda _, n=name: self._do_kbd(n))
+
+        self._color_btn.clicked.connect(self._pick_color)
+        self._apply_aura_btn.clicked.connect(self._do_aura)
 
         self._slash_on_btn.clicked.connect(lambda: self._do_slash(True))
         self._slash_off_btn.clicked.connect(lambda: self._do_slash(False))
@@ -819,6 +946,30 @@ class MainWindow(QWidget):
             _save_setting("kbd", level)
         self._set_status(f"Keyboard → {level}" if ok else f"Error: {msg[:70]}",
                          "#0ea5e9" if ok else "#ef4444")
+
+    def _pick_color(self):
+        initial = QColor(f"#{self._kbd_color}")
+        color = QColorDialog.getColor(initial, self, "Keyboard Backlight Color")
+        if color.isValid():
+            hex_color = color.name().lstrip("#")
+            self._kbd_color = hex_color
+            self._color_btn.setStyleSheet(
+                f"background-color: #{hex_color}; border: 1px solid #1e293b; border-radius: 4px;"
+            )
+            _save_setting("kbd_color", hex_color)
+
+    def _do_aura(self):
+        effect_idx = self._effect_combo.currentIndex()
+        effect = Backend._AURA_EFFECTS[effect_idx]
+        color = self._kbd_color
+        speed = "med"  # sensible default
+        ok, msg = Backend.set_aura_effect(effect, color=color, speed=speed)
+        if ok:
+            _save_setting("kbd_effect", effect)
+        self._set_status(
+            f"Aura → {effect} (#{color})" if ok else f"Aura error: {msg[:60]}",
+            "#0ea5e9" if ok else "#ef4444"
+        )
 
     def _do_slash(self, enabled):
         ok, msg = Backend.set_slash(enabled)
@@ -1181,6 +1332,7 @@ class GHelperApp:
 
         _ensure_asusd()
         _ensure_supergfxd()
+        Backend.ensure_kbd_power()
 
         self.win = MainWindow()
         self._build_tray()
