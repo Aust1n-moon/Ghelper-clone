@@ -658,6 +658,7 @@ class MainWindow(QWidget):
         self._worker = None
         self._gpu_worker = None
         self._gpu_pending = None
+        self._rebooting = False
         self._restore_settings()
         self._schedule_refresh()
 
@@ -997,6 +998,7 @@ class MainWindow(QWidget):
         _save_setting("gpu", mode)
         self._sync_power_mode()
         self._set_status(f"GPU → {mode}  Rebooting…", "#dc2626")
+        self._rebooting = True
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
     def _do_limit(self, limit):
@@ -1108,13 +1110,13 @@ class MainWindow(QWidget):
             self._kbd.set_active("Low")
             if not first_launch:
                 cur_gpu = Backend.get_gpu_mode()
-                if cur_gpu != "Integrated":
-                    self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
-                    self._do_gpu("Integrated")
+                if cur_gpu != "Hybrid":
+                    self._set_status("Plugged in → AC mode · switching GPU to Hybrid…", "#f59e0b")
+                    self._do_gpu("Hybrid")
                 else:
-                    self._set_status("Unplugged → full battery mode active", "#f59e0b")
+                    self._set_status("Plugged in → AC mode active", "#f59e0b")
             else:
-                self._set_status("Unplugged → full battery mode active", "#f59e0b")
+                self._set_status("Plugged in → AC mode active", "#f59e0b")
     # ---------------------------------------------------------------- restore saved settings
 
     def _restore_settings(self):
@@ -1135,22 +1137,18 @@ class MainWindow(QWidget):
         fan = s.get("fan_preset")
         if fan and fan in self._fan.buttons:
             self._fan.set_active(fan)
-            # Re-apply in background so fan curve survives reboots
-        if not self._auto_switch.isChecked():
-            import threading
-            threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
 
         kbd = s.get("kbd")
         if kbd and kbd in self._kbd.buttons:
-            # Pre-select while waiting for first status poll
             self._kbd.set_active(kbd)
 
         gpu = s.get("gpu", "Integrated")
         if gpu not in self._gpu.buttons:
             gpu = "Integrated"
         self._gpu.set_active(gpu)
-        import threading
-        threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
+        if not self._auto_switch.isChecked():
+            import threading
+            threading.Thread(target=Backend.set_gpu_mode, args=(gpu,), daemon=True).start()
 
         slash = s.get("slash")
         if slash is not None:
@@ -1340,11 +1338,10 @@ class GHelperApp:
         self.win.show()
 
     def _on_quit(self):
-        # Only reset GPU on exit when auto-switch is managing the GPU mode.
-        # When the user has manually chosen a mode (e.g. Dedicated), respect it
-        # across restarts by leaving the saved setting intact.
-        if self.win._auto_switch.isChecked():
-            Backend.set_gpu_mode("Integrated")
+        # Never touch GPU on quit — switching mid-teardown races with
+        # supergfxd and crashes the kernel.  The saved mode persists;
+        # auto-switch handles AC/battery transitions on next launch.
+        pass
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(_make_icon(), self.app)
