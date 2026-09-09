@@ -347,7 +347,22 @@ class Backend:
         # MUX switches (AsusMuxDgpu) take significantly longer than hybrid/integrated
         timeout = 180 if sgfx_mode == "AsusMuxDgpu" else 60
         out, err, rc = _run(f"supergfxctl -m {sgfx_mode}", timeout=timeout)
-        return rc == 0, err or out
+        if rc != 0:
+            return False, err or out
+        # supergfxd bug: daemon updates in-memory state but doesn't
+        # persist to /etc/supergfxd.conf, so mode reverts on reboot.
+        persist_ok, persist_err = Backend._persist_supergfxd_mode(sgfx_mode)
+        if not persist_ok:
+            return True, f"switched but config not saved: {persist_err}"
+        return True, ""
+
+    @staticmethod
+    def _persist_supergfxd_mode(sgfx_mode):
+        """Ensure supergfxd.conf reflects the switched mode.
+        Uses the polkit-authorized ghelper-power helper (sudo tee has no
+        polkit policy and fails silently in background threads)."""
+        _, err, rc = _run(f"sudo /usr/local/bin/ghelper-power gpu {sgfx_mode}", timeout=10)
+        return rc == 0, err
 
     @staticmethod
     def get_temps():
@@ -365,6 +380,10 @@ class Backend:
                     # First amdgpu = iGPU, second = dGPU (when active)
                     key = "gpu2" if "gpu" in temps else "gpu"
                     temps[key] = int(t) // 1000
+            elif name == "nvidia":
+                t = _sysfs(f"{hwmon_path}/temp1_input")
+                if t:
+                    temps["gpu2"] = int(t) // 1000
         return temps
 
     @staticmethod
@@ -658,7 +677,6 @@ class MainWindow(QWidget):
         self._worker = None
         self._gpu_worker = None
         self._gpu_pending = None
-        self._rebooting = False
         self._restore_settings()
         self._schedule_refresh()
 
@@ -739,7 +757,7 @@ class MainWindow(QWidget):
         self._epp_label.setStyleSheet("color: #64748b; font-size: 11px;")
         gl.addWidget(self._epp_label)
         self._auto_switch = QCheckBox("Auto-switch on AC / battery  (profile · GPU · fan · display · kbd · slash)")
-        self._auto_switch.setChecked(_load_settings().get("auto_switch", True))
+        self._auto_switch.setChecked(_load_settings().get("auto_switch", False))
         self._auto_switch.setStyleSheet("color: #94a3b8; font-size: 11px;")
         self._auto_switch.toggled.connect(lambda v: _save_setting("auto_switch", v))
         gl.addWidget(self._auto_switch)
@@ -996,9 +1014,12 @@ class MainWindow(QWidget):
             return
         self._gpu_pending = mode
         _save_setting("gpu", mode)
-        self._sync_power_mode()
+        if msg:
+            # GPU switched at runtime but config didn't persist —
+            # rebooting would revert to the old mode.
+            self._set_status(f"GPU → {mode}  (warning: {msg[:60]})", "#f59e0b")
+            return
         self._set_status(f"GPU → {mode}  Rebooting…", "#dc2626")
-        self._rebooting = True
         QTimer.singleShot(1500, lambda: _run("systemctl reboot", timeout=10))
 
     def _do_limit(self, limit):
