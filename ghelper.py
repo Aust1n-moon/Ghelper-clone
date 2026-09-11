@@ -672,6 +672,7 @@ class MainWindow(QWidget):
         self._last_ac_status = None
         self._native_rate = None
         self._intended_profile = None   # profile ghelper actively defends
+        self._power_mode_state = None   # "battery" or "ac" — what ghelper last applied
         self._build_ui()
         self._connect()
         self._worker = None
@@ -1040,6 +1041,8 @@ class MainWindow(QWidget):
         self._set_status(f"Applying {mode} power tweaks…", "#f59e0b")
         ok, msg = Backend.apply_power_mode(mode)
         label = "Battery" if mode == "battery" else "AC"
+        if ok:
+            self._power_mode_state = mode
         self._set_status(
             f"Power tweaks → {label}  (boost·freq·ASPM·PCI-PM·GPU-DPM·WiFi·USB·audio·NMI)"
             if ok else f"Power tweak error: {msg[:60]}",
@@ -1105,15 +1108,7 @@ class MainWindow(QWidget):
             self._kbd.set_active("Off")
             Backend.set_slash(False)
             self._slash_off_btn.setChecked(True)
-            if not first_launch:
-                cur_gpu = Backend.get_gpu_mode()
-                if cur_gpu != "Integrated":
-                    self._set_status("Unplugged → full battery mode · switching GPU to Integrated…", "#f59e0b")
-                    self._do_gpu("Integrated")
-                else:
-                    self._set_status("Unplugged → full battery mode active", "#f59e0b")
-            else:
-                self._set_status("Unplugged → full battery mode active", "#f59e0b")
+            self._set_status("Unplugged → full battery mode active", "#f59e0b")
 
         elif was_battery and now_on_ac:
             # AC: Balanced + AC power tweaks + Balanced fan + Native
@@ -1129,15 +1124,7 @@ class MainWindow(QWidget):
             self._power_mode.set_active("AC")
             Backend.set_kbd_brightness("Low")
             self._kbd.set_active("Low")
-            if not first_launch:
-                cur_gpu = Backend.get_gpu_mode()
-                if cur_gpu != "Hybrid":
-                    self._set_status("Plugged in → AC mode · switching GPU to Hybrid…", "#f59e0b")
-                    self._do_gpu("Hybrid")
-                else:
-                    self._set_status("Plugged in → AC mode active", "#f59e0b")
-            else:
-                self._set_status("Plugged in → AC mode active", "#f59e0b")
+            self._set_status("Plugged in → AC mode active", "#f59e0b")
     # ---------------------------------------------------------------- restore saved settings
 
     def _restore_settings(self):
@@ -1296,11 +1283,13 @@ class MainWindow(QWidget):
             boost_color = "#ef4444" if boost else "#22c55e"
             self._boost_label.setText(f"CPU Boost: {boost_txt}")
             self._boost_label.setStyleSheet(f"color: {boost_color}; font-size: 10px;")
-            # Reflect in power mode button
-            if not boost:
-                self._power_mode.set_active("Battery")
-            else:
-                self._power_mode.set_active("AC")
+
+        # Reflect power mode from ghelper's own state (not boost, which
+        # auto-cpufreq may override independently)
+        if self._power_mode_state == "battery":
+            self._power_mode.set_active("Battery")
+        elif self._power_mode_state == "ac":
+            self._power_mode.set_active("AC")
 
         self._hdr_status.setText(f"{profile}  ·  {cap}%")
 
